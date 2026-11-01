@@ -1,0 +1,3 @@
+job x-vnd.amdgpu-navi-dev {
+	launch /bin/sh /boot/home/config/settings/navi-dev.sh
+}

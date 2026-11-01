@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 02:41:10 +0100
+Subject: [PATCH] Haiku support
+
+Haiku is one of the common Unix platforms; its executable path comes from
+the team's application image, there is no libm, and secure_getenv() is
+the BSDs' fallback. Headless surfaces may carry the Haiku view structure
+of vulkan_haiku.h on to the driver.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt              |  2 +-
+ loader/CMakeLists.txt       |  7 ++++++-
+ loader/loader_environment.c |  2 +-
+ loader/vk_loader_platform.c | 19 +++++++++++++++++++
+ loader/vk_loader_platform.h |  3 ++-
+ loader/wsi.c                |  8 ++++++++
+ 6 files changed, 37 insertions(+), 4 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 33741ef..66ebaa4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -136,7 +136,7 @@ elseif(APPLE)
+     if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+         target_compile_definitions(platform_wsi INTERFACE VK_USE_PLATFORM_MACOS_MVK)
+     endif()
+-elseif(CMAKE_SYSTEM_NAME MATCHES "Linux|BSD|DragonFly|GNU|CYGWIN")
++elseif(CMAKE_SYSTEM_NAME MATCHES "Linux|BSD|DragonFly|GNU|CYGWIN|Haiku")
+     option(BUILD_WSI_XCB_SUPPORT "Build XCB WSI support" ON)
+     option(BUILD_WSI_XLIB_SUPPORT "Build Xlib WSI support" ON)
+     option(BUILD_WSI_XLIB_XRANDR_SUPPORT "Build X11 Xrandr WSI support" ON)
+diff --git a/loader/CMakeLists.txt b/loader/CMakeLists.txt
+index 5957081..80eac84 100644
+--- a/loader/CMakeLists.txt
++++ b/loader/CMakeLists.txt
+@@ -439,7 +439,12 @@ else()
+         VERSION "${VULKAN_LOADER_VERSION}"
+     )
+ 
+-    target_link_libraries(vulkan PRIVATE ${CMAKE_DL_LIBS} m Threads::Threads)
++    if(CMAKE_SYSTEM_NAME STREQUAL "Haiku")
++        # Haiku's libroot has the math functions; there is no libm
++        target_link_libraries(vulkan PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
++    else()
++        target_link_libraries(vulkan PRIVATE ${CMAKE_DL_LIBS} m Threads::Threads)
++    endif()
+ 
+     set_target_properties(vulkan PROPERTIES OUTPUT_NAME ${API_TYPE})
+ 
+diff --git a/loader/loader_environment.c b/loader/loader_environment.c
+index bde33ce..60ee764 100644
+--- a/loader/loader_environment.c
++++ b/loader/loader_environment.c
+@@ -49,7 +49,7 @@ char *loader_getenv(const char *name, const struct loader_instance *inst) {
+ }
+ 
+ char *loader_secure_getenv(const char *name, const struct loader_instance *inst) {
+-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__)
++#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__HAIKU__)
+     // Apple does not appear to have a secure getenv implementation.
+     // The main difference between secure getenv and getenv is that secure getenv
+     // returns NULL if the process is being run with elevated privileges by a normal user.
+diff --git a/loader/vk_loader_platform.c b/loader/vk_loader_platform.c
+index 5ae5ff6..f6fa32e 100644
+--- a/loader/vk_loader_platform.c
++++ b/loader/vk_loader_platform.c
+@@ -133,6 +133,25 @@ char *loader_platform_executable_path(const struct loader_instance *inst, bool *
+ 
+     return buffer;
+ }
++#elif defined(__HAIKU__)
++#include <image.h>
++char *loader_platform_executable_path(const struct loader_instance *inst, bool *oom) {
++    // The team's application image is the executable.
++    image_info info;
++    int32 cookie = 0;
++    while (get_next_image_info(B_CURRENT_TEAM, &cookie, &info) == B_OK) {
++        if (info.type != B_APP_IMAGE) continue;
++        size_t size = strlen(info.name) + 1;
++        char *buffer = loader_instance_heap_calloc(inst, size, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
++        if (NULL == buffer) {
++            *oom = true;
++            return NULL;
++        }
++        memcpy(buffer, info.name, size);
++        return buffer;
++    }
++    return NULL;
++}
+ #elif defined(__Fuchsia__) || defined(__OpenBSD__)
+ char *loader_platform_executable_path(const struct loader_instance *inst, bool *oom) {
+     (void)inst;
+diff --git a/loader/vk_loader_platform.h b/loader/vk_loader_platform.h
+index f232880..916bd91 100644
+--- a/loader/vk_loader_platform.h
++++ b/loader/vk_loader_platform.h
+@@ -44,7 +44,8 @@
+ 
+ // Set of platforms with a common set of functionality which is queried throughout the program
+ #if defined(__linux__) || defined(__APPLE__) || defined(__Fuchsia__) || defined(__QNX__) || defined(__FreeBSD__) || \
+-    defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__GNU__) || defined(__CYGWIN__)
++    defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__GNU__) || defined(__CYGWIN__) || \
++    defined(__HAIKU__)
+ #define COMMON_UNIX_PLATFORMS 1
+ #else
+ #define COMMON_UNIX_PLATFORMS 0
+diff --git a/loader/wsi.c b/loader/wsi.c
+index e6b349c..2f1c98c 100644
+--- a/loader/wsi.c
++++ b/loader/wsi.c
+@@ -34,6 +34,10 @@
+ #include "vk_loader_platform.h"
+ #include "wsi.h"
+ 
++#if defined(__HAIKU__)
++#include <vulkan/vulkan_haiku.h>
++#endif
++
+ // The first ICD/Loader interface that support querying the SurfaceKHR from
+ // the ICDs.
+ #define ICD_VER_SUPPORTS_ICD_SURFACE_KHR 3
+@@ -1472,6 +1476,10 @@ VKAPI_ATTR VkResult VKAPI_CALL terminator_CreateHeadlessSurfaceEXT(VkInstance in
+ 
+     const struct loader_struct_type_info ci_types[] = {
+         {VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT, sizeof(VkHeadlessSurfaceCreateInfoEXT)},
++#if defined(__HAIKU__)
++        // A Haiku window for the driver to present into (vulkan_haiku.h)
++        {VK_STRUCTURE_TYPE_HAIKU_VIEW_SURFACE_CREATE_INFO_HAIKU, sizeof(VkHaikuViewSurfaceCreateInfoHAIKU)},
++#endif
+     };
+     result = copy_surface_create_info(loader_inst, icd_surface, pCreateInfo, sizeof(ci_types) / sizeof(ci_types[0]), ci_types,
+                                       "VkHeadlessSurfaceCreateInfoEXT", pAllocator);

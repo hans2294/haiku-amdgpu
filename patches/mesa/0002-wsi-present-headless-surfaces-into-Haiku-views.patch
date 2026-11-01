@@ -1,0 +1,414 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 02:41:10 +0100
+Subject: [PATCH] wsi: present headless surfaces into Haiku views
+
+A headless surface created with VkHaikuViewSurfaceCreateInfoHAIKU
+(vulkan_haiku.h) gets CPU images (a GPU blit to a linear buffer), the
+view's size and BGRA formats, and each present waits for the blit and
+draws the rows into the view through a BBitmap, with the window locked.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/vulkan/vulkan_haiku.h        |  39 +++++++++
+ src/vulkan/wsi/meson.build           |   6 ++
+ src/vulkan/wsi/wsi_common_haiku.cpp  |  89 +++++++++++++++++++++
+ src/vulkan/wsi/wsi_common_haiku.h    |  32 ++++++++
+ src/vulkan/wsi/wsi_common_headless.c | 114 +++++++++++++++++++++++++--
+ 5 files changed, 275 insertions(+), 5 deletions(-)
+ create mode 100644 include/vulkan/vulkan_haiku.h
+ create mode 100644 src/vulkan/wsi/wsi_common_haiku.cpp
+ create mode 100644 src/vulkan/wsi/wsi_common_haiku.h
+
+diff --git a/include/vulkan/vulkan_haiku.h b/include/vulkan/vulkan_haiku.h
+new file mode 100644
+index 0000000..30e9db6
+--- /dev/null
++++ b/include/vulkan/vulkan_haiku.h
+@@ -0,0 +1,39 @@
++#ifndef VULKAN_HAIKU_H_
++#define VULKAN_HAIKU_H_ 1
++
++/*
++** Copyright 2026, hans2294.
++** Distributed under the terms of the MIT License.
++*/
++
++/*
++ * Vulkan surfaces in Haiku windows, ahead of a registered extension: chain a
++ * VkHaikuViewSurfaceCreateInfoHAIKU into the VkHeadlessSurfaceCreateInfoEXT
++ * of vkCreateHeadlessSurfaceEXT (VK_EXT_headless_surface). A driver that
++ * knows the structure presents into the BView, and the swapchain extent
++ * follows the view's bounds; others ignore it and make a headless surface.
++ *
++ * The structure type is not one Khronos handed out (it lies in the block
++ * of extension number 1000); it is local to this Haiku port.
++ */
++
++#include "vulkan_core.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define VK_STRUCTURE_TYPE_HAIKU_VIEW_SURFACE_CREATE_INFO_HAIKU \
++    ((VkStructureType)1000999000)
++
++typedef struct VkHaikuViewSurfaceCreateInfoHAIKU {
++    VkStructureType    sType;
++    const void*        pNext;
++    void*              view;    /* a BView* in a window; must outlive the surface */
++} VkHaikuViewSurfaceCreateInfoHAIKU;
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/vulkan/wsi/meson.build b/src/vulkan/wsi/meson.build
+index 80925d1..f5887da 100644
+--- a/src/vulkan/wsi/meson.build
++++ b/src/vulkan/wsi/meson.build
+@@ -34,6 +34,12 @@ else
+   files_vulkan_wsi += files('wsi_common_headless.c')
+ endif
+ 
++if host_machine.system() == 'haiku'
++  # Presenting headless surfaces into Haiku views (vulkan_haiku.h)
++  files_vulkan_wsi += files('wsi_common_haiku.cpp')
++  platform_deps += cpp.find_library('be')
++endif
++
+ if with_platform_macos
+   files_vulkan_wsi += files('wsi_common_metal.c', 'wsi_common_metal_layer.m')
+ endif
+diff --git a/src/vulkan/wsi/wsi_common_haiku.cpp b/src/vulkan/wsi/wsi_common_haiku.cpp
+new file mode 100644
+index 0000000..ab220a3
+--- /dev/null
++++ b/src/vulkan/wsi/wsi_common_haiku.cpp
+@@ -0,0 +1,89 @@
++/*
++ * Copyright 2026, hans2294.
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Haiku presentation for the headless WSI: each presented image is copied
++ * into a BBitmap and drawn in the application's BView, with the view's
++ * window locked, as Haiku's BGLView does in SwapBuffers().
++ */
++
++#include "wsi_common_haiku.h"
++
++#include <new>
++#include <string.h>
++
++#include <Bitmap.h>
++#include <View.h>
++#include <Window.h>
++
++struct wsi_haiku_presenter {
++   BView *view;
++   BBitmap *bitmap;
++};
++
++extern "C" bool
++wsi_haiku_view_extent(void *_view, uint32_t *width, uint32_t *height)
++{
++   BView *view = (BView *)_view;
++   if (!view->LockLooper())
++      return false;
++   BRect bounds = view->Bounds();
++   view->UnlockLooper();
++   *width = bounds.IntegerWidth() + 1;
++   *height = bounds.IntegerHeight() + 1;
++   return true;
++}
++
++extern "C" struct wsi_haiku_presenter *
++wsi_haiku_presenter_create(void *view)
++{
++   wsi_haiku_presenter *presenter = new(std::nothrow) wsi_haiku_presenter;
++   if (presenter == NULL)
++      return NULL;
++   presenter->view = (BView *)view;
++   presenter->bitmap = NULL;
++   return presenter;
++}
++
++extern "C" void
++wsi_haiku_presenter_destroy(struct wsi_haiku_presenter *presenter)
++{
++   if (presenter == NULL)
++      return;
++   delete presenter->bitmap;
++   delete presenter;
++}
++
++extern "C" bool
++wsi_haiku_present(struct wsi_haiku_presenter *presenter, const void *pixels,
++                  uint32_t row_pitch, uint32_t width, uint32_t height)
++{
++   BBitmap *bitmap = presenter->bitmap;
++   if (bitmap == NULL || bitmap->Bounds().IntegerWidth() + 1 != (int32)width
++       || bitmap->Bounds().IntegerHeight() + 1 != (int32)height) {
++      delete bitmap;
++      bitmap = new(std::nothrow) BBitmap(BRect(0, 0, width - 1, height - 1),
++                                         B_RGB32);
++      presenter->bitmap = bitmap;
++      if (bitmap == NULL || bitmap->InitCheck() != B_OK)
++         return false;
++   }
++
++   uint8 *destination = (uint8 *)bitmap->Bits();
++   const uint8 *source = (const uint8 *)pixels;
++   int32 destinationPitch = bitmap->BytesPerRow();
++   for (uint32_t y = 0; y < height; y++) {
++      memcpy(destination, source, width * 4);
++      destination += destinationPitch;
++      source += row_pitch;
++   }
++
++   BView *view = presenter->view;
++   if (!view->LockLooper())
++      return false;
++   view->DrawBitmap(bitmap, BPoint(0, 0));
++   view->Sync();
++   view->UnlockLooper();
++   return true;
++}
+diff --git a/src/vulkan/wsi/wsi_common_haiku.h b/src/vulkan/wsi/wsi_common_haiku.h
+new file mode 100644
+index 0000000..f4a8e95
+--- /dev/null
++++ b/src/vulkan/wsi/wsi_common_haiku.h
+@@ -0,0 +1,32 @@
++/*
++ * Copyright 2026, hans2294.
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef WSI_COMMON_HAIKU_H
++#define WSI_COMMON_HAIKU_H
++
++/* Presenting into a Haiku BView (vulkan_haiku.h); C++ in
++ * wsi_common_haiku.cpp. */
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct wsi_haiku_presenter;
++
++bool wsi_haiku_view_extent(void *view, uint32_t *width, uint32_t *height);
++struct wsi_haiku_presenter *wsi_haiku_presenter_create(void *view);
++void wsi_haiku_presenter_destroy(struct wsi_haiku_presenter *presenter);
++/* Copies BGRA8 rows into the view; false when the view is gone. */
++bool wsi_haiku_present(struct wsi_haiku_presenter *presenter,
++                       const void *pixels, uint32_t row_pitch,
++                       uint32_t width, uint32_t height);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/vulkan/wsi/wsi_common_headless.c b/src/vulkan/wsi/wsi_common_headless.c
+index 23b375f..3384178 100644
+--- a/src/vulkan/wsi/wsi_common_headless.c
++++ b/src/vulkan/wsi/wsi_common_headless.c
+@@ -33,10 +33,34 @@
+ 
+ #include "drm-uapi/drm_fourcc.h"
+ 
++#ifdef __HAIKU__
++#include <vulkan/vulkan_haiku.h>
++#include "wsi_common_haiku.h"
++#endif
++
+ struct wsi_headless {
+    struct wsi_interface base;
+ };
+ 
++/* Every headless surface Mesa makes; on Haiku it may come with a BView to
++ * present into (vulkan_haiku.h). */
++struct wsi_headless_surface {
++   VkIcdSurfaceHeadless base;
++   void *haiku_view;
++};
++
++static void *
++wsi_headless_surface_haiku_view(VkIcdSurfaceBase *surface)
++{
++   return ((struct wsi_headless_surface *)surface)->haiku_view;
++}
++
++/* What a Haiku view takes: B_RGB32 is BGRA in memory. */
++static const VkFormat haiku_formats[] = {
++   VK_FORMAT_B8G8R8A8_SRGB,
++   VK_FORMAT_B8G8R8A8_UNORM,
++};
++
+ static VkResult
+ wsi_headless_surface_get_support(VkIcdSurfaceBase *surface,
+                                  struct wsi_device *wsi_device,
+@@ -69,6 +93,19 @@ wsi_headless_surface_get_capabilities(VkIcdSurfaceBase *surface,
+    caps->surfaceCapabilities.maxImageCount = 0;
+ 
+    caps->surfaceCapabilities.currentExtent = (VkExtent2D) { -1, -1 };
++
++#ifdef __HAIKU__
++   /* Presenting into a view copies on the CPU, synchronously; two images
++    * are plenty, and the view decides the size. */
++   void *view = wsi_headless_surface_haiku_view(surface);
++   if (view != NULL) {
++      uint32_t width, height;
++      caps->surfaceCapabilities.minImageCount = 2;
++      if (!wsi_haiku_view_extent(view, &width, &height))
++         return VK_ERROR_SURFACE_LOST_KHR;
++      caps->surfaceCapabilities.currentExtent = (VkExtent2D) { width, height };
++   }
++#endif
+    caps->surfaceCapabilities.minImageExtent = (VkExtent2D) { 1, 1 };
+    caps->surfaceCapabilities.maxImageExtent = (VkExtent2D) {
+       wsi_device->maxImageDimension2D,
+@@ -181,6 +218,16 @@ wsi_headless_surface_get_formats(VkIcdSurfaceBase *icd_surface,
+ {
+    VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormatKHR, out, pSurfaceFormats, pSurfaceFormatCount);
+ 
++   if (wsi_headless_surface_haiku_view(icd_surface) != NULL) {
++      for (unsigned i = 0; i < ARRAY_SIZE(haiku_formats); i++) {
++         vk_outarray_append_typed(VkSurfaceFormatKHR, &out, out_fmt) {
++            out_fmt->format = haiku_formats[i];
++            out_fmt->colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++         }
++      }
++      return vk_outarray_status(&out);
++   }
++
+    if (wsi_device->force_bgra8_unorm_first) {
+       vk_outarray_append_typed(VkSurfaceFormatKHR, &out, out_fmt) {
+          out_fmt->format = VK_FORMAT_B8G8R8A8_UNORM;
+@@ -229,6 +276,16 @@ wsi_headless_surface_get_formats2(VkIcdSurfaceBase *icd_surface,
+ {
+    VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormat2KHR, out, pSurfaceFormats, pSurfaceFormatCount);
+ 
++   if (wsi_headless_surface_haiku_view(icd_surface) != NULL) {
++      for (unsigned i = 0; i < ARRAY_SIZE(haiku_formats); i++) {
++         vk_outarray_append_typed(VkSurfaceFormat2KHR, &out, out_fmt) {
++            out_fmt->surfaceFormat.format = haiku_formats[i];
++            out_fmt->surfaceFormat.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++         }
++      }
++      return vk_outarray_status(&out);
++   }
++
+    if (wsi_device->force_bgra8_unorm_first) {
+       vk_outarray_append_typed(VkSurfaceFormat2KHR, &out, out_fmt) {
+          out_fmt->surfaceFormat.format = VK_FORMAT_B8G8R8A8_UNORM;
+@@ -325,6 +382,11 @@ struct wsi_headless_image {
+ 
+ struct wsi_headless_swapchain {
+    struct wsi_swapchain base;
++#ifdef __HAIKU__
++   /* when presenting into a Haiku view */
++   struct wsi_haiku_presenter *haiku_presenter;
++   VkExtent2D extent;
++#endif
+    struct wsi_headless_image images[0];
+ };
+ VK_DEFINE_NONDISP_HANDLE_CASTS(wsi_headless_swapchain, base.base, VkSwapchainKHR,
+@@ -408,6 +470,22 @@ wsi_headless_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
+ 
+    assert(image_index < chain->base.image_count);
+ 
++#ifdef __HAIKU__
++   if (chain->haiku_presenter != NULL) {
++      /* The image reaches its CPU-visible copy by a blit on the GPU; only
++       * software drivers have the common code wait for it. */
++      struct wsi_image *image = &chain->images[image_index].base;
++      chain->base.wsi->WaitForFences(chain->base.device, 1,
++                                     &chain->base.fences[image_index],
++                                     true, UINT64_MAX);
++      bool shown = wsi_haiku_present(chain->haiku_presenter, image->cpu_map,
++                                     image->row_pitches[0], chain->extent.width,
++                                     chain->extent.height);
++      chain->images[image_index].busy_on_host = false;
++      return shown ? VK_SUCCESS : VK_ERROR_SURFACE_LOST_KHR;
++   }
++#endif
++
+    chain->images[image_index].busy_on_host = false;
+ 
+    return VK_SUCCESS;
+@@ -436,6 +514,10 @@ wsi_headless_swapchain_destroy(struct wsi_swapchain *wsi_chain,
+ 
+    wsi_swapchain_finish(&chain->base);
+ 
++#ifdef __HAIKU__
++   wsi_haiku_presenter_destroy(chain->haiku_presenter);
++#endif
++
+    vk_free(pAllocator, chain);
+ 
+    return VK_SUCCESS;
+@@ -490,7 +572,8 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+    struct wsi_base_image_params *image_params = NULL;
+    struct wsi_cpu_image_params cpu_params;
+    struct wsi_drm_image_params drm_params;
+-   if (wsi_device->sw) {
++   void *haiku_view = wsi_headless_surface_haiku_view(icd_surface);
++   if (wsi_device->sw || haiku_view != NULL) {
+       cpu_params = (struct wsi_cpu_image_params) {
+          .base.image_type = WSI_IMAGE_TYPE_CPU,
+       };
+@@ -515,6 +598,18 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+    if (result != VK_SUCCESS)
+       goto fail_free_chain;
+ 
++#ifdef __HAIKU__
++   if (haiku_view != NULL) {
++      chain->haiku_presenter = wsi_haiku_presenter_create(haiku_view);
++      chain->extent = pCreateInfo->imageExtent;
++      if (chain->haiku_presenter == NULL) {
++         wsi_swapchain_finish(&chain->base);
++         vk_free(pAllocator, chain);
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++   }
++#endif
++
+    chain->base.destroy = wsi_headless_swapchain_destroy;
+    chain->base.get_wsi_image = wsi_headless_swapchain_get_wsi_image;
+    chain->base.acquire_next_image = wsi_headless_swapchain_acquire_next_image;
+@@ -601,15 +696,24 @@ VkResult wsi_CreateHeadlessSurfaceEXT(
+     VkSurfaceKHR*                               pSurface)
+ {
+    VK_FROM_HANDLE(vk_instance, instance, _instance);
+-   VkIcdSurfaceHeadless *surface;
++   struct wsi_headless_surface *surface;
+ 
+    surface = vk_alloc2(&instance->alloc, pAllocator, sizeof *surface, 8,
+                        VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+    if (surface == NULL)
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+ 
+-   surface->base.platform = VK_ICD_WSI_PLATFORM_HEADLESS;
+-
+-   *pSurface = VkIcdSurfaceBase_to_handle(&surface->base);
++   surface->base.base.platform = VK_ICD_WSI_PLATFORM_HEADLESS;
++   surface->haiku_view = NULL;
++#ifdef __HAIKU__
++   /* not in vk.xml, so without vk_find_struct()'s generated casts */
++   const VkHaikuViewSurfaceCreateInfoHAIKU *haiku_info =
++      (const VkHaikuViewSurfaceCreateInfoHAIKU *)__vk_find_struct(
++         (void *)pCreateInfo->pNext, VK_STRUCTURE_TYPE_HAIKU_VIEW_SURFACE_CREATE_INFO_HAIKU);
++   if (haiku_info != NULL)
++      surface->haiku_view = haiku_info->view;
++#endif
++
++   *pSurface = VkIcdSurfaceBase_to_handle(&surface->base.base);
+    return VK_SUCCESS;
+ }

@@ -1,0 +1,36 @@
+# Linux headers used as they are: pure declarations or data structures with
+# no OS underneath. cc.sh links them into the include path after linuxkpi.
+linux/hdmi.h
+linux/rbtree.h
+linux/rbtree_types.h
+linux/rbtree_augmented.h
+linux/interval_tree.h
+linux/interval_tree_generic.h
+linux/crc16.h
+linux/hash.h
+linux/jhash.h
+linux/unaligned/packed_struct.h
+linux/average.h
+# Part of the ported dma-buf code itself
+linux/dma-fence.h
+linux/dma-fence-array.h
+linux/dma-fence-chain.h
+linux/dma-fence-unwrap.h
+linux/dma-resv.h
+linux/dma-buf.h
+linux/sync_file.h
+linux/iosys-map.h
+# Linux library code compiled along (lib/xarray.c, lib/idr.c, ...)
+linux/xarray.h
+linux/idr.h
+linux/radix-tree.h
+linux/kfifo.h
+linux/list_bl.h
+linux/bitmap.h
+linux/find.h
+linux/string_choices.h
+linux/bitmap-str.h
+# Trace event headers (our tracepoint.h turns them into empty inlines)
+trace/events/dma_fence.h
+linux/gpu_buddy.h
+linux/units.h

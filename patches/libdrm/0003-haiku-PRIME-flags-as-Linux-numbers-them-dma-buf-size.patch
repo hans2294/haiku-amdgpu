@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 10:06:42 +0100
+Subject: [PATCH] haiku: PRIME flags as Linux numbers them, dma-buf size by
+ ioctl
+
+dma-buf fds are Haiku fds on linuxkpi's file node now, so PRIME works as
+on Linux once DRM_CLOEXEC/DRM_RDWR are translated; lseek() cannot tell a
+dma-buf's size there, LINUXKPI_IOCTL_FILE_SIZE does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ amdgpu/amdgpu_bo.c   |  8 ++++++++
+ haiku/libdrm_haiku.c | 10 ++++++++++
+ haiku/libdrm_haiku.h |  8 ++++++++
+ xf86drm.c            |  5 +++++
+ 4 files changed, 31 insertions(+)
+
+diff --git a/amdgpu/amdgpu_bo.c b/amdgpu/amdgpu_bo.c
+index 74e6398..3967fc7 100644
+--- a/amdgpu/amdgpu_bo.c
++++ b/amdgpu/amdgpu_bo.c
+@@ -278,12 +278,20 @@ drm_public int amdgpu_bo_import(amdgpu_device_handle dev,
+ 			goto unlock;
+ 
+ 		/* Query the buffer size. */
++#ifdef __HAIKU__
++		size = drm_haiku_file_size(shared_handle);
++		if (size == (off_t)-1) {
++			r = -errno;
++			goto free_bo_handle;
++		}
++#else
+ 		size = lseek(shared_handle, 0, SEEK_END);
+ 		if (size == (off_t)-1) {
+ 			r = -errno;
+ 			goto free_bo_handle;
+ 		}
+ 		lseek(shared_handle, 0, SEEK_SET);
++#endif
+ 
+ 		dma_buf_size = size;
+ 		shared_handle = handle;
+diff --git a/haiku/libdrm_haiku.c b/haiku/libdrm_haiku.c
+index 0ebdd96..8dc1425 100644
+--- a/haiku/libdrm_haiku.c
++++ b/haiku/libdrm_haiku.c
+@@ -144,6 +144,16 @@ drm_haiku_node_name_for_fd(int fd, const char *prefix)
+ 	descriptor: remember the one each mapping was made through. If that one
+ 	is closed by then, any DRM node will do.
+ */
++off_t
++drm_haiku_file_size(int fd)
++{
++	struct linuxkpi_file_size request;
++	if (ioctl(fd, LINUXKPI_IOCTL_FILE_SIZE, &request, sizeof(request)) != 0)
++		return -1;
++	return request.size;
++}
++
++
+ struct mapping {
+ 	struct mapping *next;
+ 	void *address;
+diff --git a/haiku/libdrm_haiku.h b/haiku/libdrm_haiku.h
+index b20eabc..2be70c5 100644
+--- a/haiku/libdrm_haiku.h
++++ b/haiku/libdrm_haiku.h
+@@ -14,6 +14,7 @@
+  */
+ 
+ #include <stddef.h>
++#include <stdint.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ 
+@@ -38,6 +39,13 @@ int drm_haiku_node_info(int maj, int min, struct linuxkpi_device_info *info);
+  * same device as \p fd; malloc()ed, or NULL. */
+ char *drm_haiku_node_name_for_fd(int fd, const char *prefix);
+ 
++/* lseek(fd, 0, SEEK_END) for a dma-buf fd: its size, or -1 with errno */
++off_t drm_haiku_file_size(int fd);
++
++/* DRM_CLOEXEC/DRM_RDWR as Linux numbers them */
++#define DRM_HAIKU_LINUX_CLOEXEC	02000000
++#define DRM_HAIKU_LINUX_RDWR	02
++
+ void *drm_haiku_mmap(void *addr, size_t length, int prot, int flags, int fd,
+ 	off_t offset);
+ int drm_haiku_munmap(void *addr, size_t length);
+diff --git a/xf86drm.c b/xf86drm.c
+index 7d92369..583e608 100644
+--- a/xf86drm.c
++++ b/xf86drm.c
+@@ -3383,7 +3383,12 @@ drm_public int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags,
+     memclear(args);
+     args.fd = -1;
+     args.handle = handle;
++#ifdef __HAIKU__
++    args.flags = (flags & DRM_RDWR ? DRM_HAIKU_LINUX_RDWR : 0)
++        | (flags & DRM_CLOEXEC ? DRM_HAIKU_LINUX_CLOEXEC : 0);
++#else
+     args.flags = flags;
++#endif
+     ret = drmIoctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &args);
+     if (ret)
+         return ret;

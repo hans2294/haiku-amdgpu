@@ -1,0 +1,34 @@
+# Settings for the amdgpu port's images and packages.
+# anyboot stores the partition size in bytes as uint32, so stay below 4 GiB
+# (vm/usb-image.sh sets a bigger size for a raw image)
+HAIKU_IMAGE_SIZE ?= 4000 ;
+
+# The VM's boot tests and ssh login; the image for a real machine goes without
+# them (NAVI_USB_IMAGE, from vm/usb-image.sh).
+if ! $(NAVI_USB_IMAGE) {
+	AddFilesToHaikuImage home config settings ssh
+		: $(HAIKU_TOP)/../vm/authorized_keys : authorized_keys ;
+	AddFilesToHaikuImage home config settings
+		: $(HAIKU_TOP)/../vm/navi-dev.sh : navi-dev.sh ;
+	AddFilesToHaikuImage home config settings launch
+		: $(HAIKU_TOP)/../vm/navi-dev.launch : navi-dev ;
+}
+
+# The port as packages, built by port/build-packages.sh: the driver (in
+# /dev/graphics, so app_server loads it at boot and puts the desktop on the card
+# through amdgpu_kms.accelerant; a virtual VGA stays fallback) with its firmware,
+# libdrm, Mesa (radeonsi, RADV, a libGL with BGLView, which replaces the system
+# Mesa) and the Vulkan loader. In system/packages they count for dependencies:
+# they provide lib:libGL for glu and others.
+HAIKU_IMAGE_OWN_MESA = 1 ;
+local packages = $(HAIKU_TOP)/../generated.x86_64/packages ;
+local package ;
+for package in amdgpu_linux-6.12.115-1 libdrm-2.4.134-1
+		mesa_radeon-26.2.6-1 vulkan_loader-1.4.367-100 {
+	if [ Glob $(packages) : $(package)-x86_64.hpkg ] {
+		AddPackageFilesToHaikuImage system packages
+			: $(packages)/$(package)-x86_64.hpkg ;
+	} else {
+		Echo "UserBuildConfig: $(package) not built; run port/build-packages.sh" ;
+	}
+}

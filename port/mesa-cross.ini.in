@@ -1,0 +1,28 @@
+# meson cross file for Mesa on Haiku x86_64, with the Haiku build's cross
+# tools and sysroot. port/mesa-build.sh fills in @TOP@.
+[binaries]
+c = '@TOP@/generated.x86_64/cross-tools-x86_64/bin/x86_64-unknown-haiku-gcc'
+cpp = '@TOP@/generated.x86_64/cross-tools-x86_64/bin/x86_64-unknown-haiku-g++'
+ar = '@TOP@/generated.x86_64/cross-tools-x86_64/bin/x86_64-unknown-haiku-ar'
+strip = '@TOP@/generated.x86_64/cross-tools-x86_64/bin/x86_64-unknown-haiku-strip'
+pkg-config = 'pkg-config'
+
+[properties]
+sys_root = '@TOP@/generated.x86_64/cross-tools-x86_64/sysroot'
+pkg_config_libdir = '@TOP@/generated.x86_64/cross-tools-x86_64/sysroot/boot/system/non-packaged/develop/lib/pkgconfig'
+
+[built-in options]
+# Positive errno as on Linux, for Mesa's comparisons with libdrm's -errno;
+# libposix_error_mapper.a makes it so (it must come before libroot, which
+# gcc adds last). libbsd has dl_iterate_phdr(), which Mesa's build-id code
+# needs (RADV hashes its build-id into its cache UUID).
+c_args = ['-DB_USE_POSITIVE_POSIX_ERRORS']
+cpp_args = ['-DB_USE_POSITIVE_POSIX_ERRORS']
+c_link_args = ['@TOP@/generated.x86_64/cross-tools-x86_64/sysroot/boot/system/non-packaged/develop/lib/libposix_error_mapper.a', '-lbsd']
+cpp_link_args = ['@TOP@/generated.x86_64/cross-tools-x86_64/sysroot/boot/system/non-packaged/develop/lib/libposix_error_mapper.a', '-lbsd']
+
+[host_machine]
+system = 'haiku'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'

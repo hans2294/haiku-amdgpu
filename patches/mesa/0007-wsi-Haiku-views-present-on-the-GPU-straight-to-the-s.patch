@@ -1,0 +1,1070 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 10:24:33 +0100
+Subject: [PATCH] wsi: Haiku views present on the GPU, straight to the screen
+ in direct mode
+
+Swapchains for a Haiku view use the GPU's own images and copy each
+present out on the present queue: into the screen's frame buffer
+(imported as a dma-buf), clipped to what the BDirectWindow reports
+through vkDirectConnectedHAIKU, or else into a staging buffer that goes
+to the view as a bitmap. FIFO waits for the vertical blank.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/vulkan/vulkan_haiku.h        |  15 +
+ src/vulkan/runtime/vk_device.c       |  10 +
+ src/vulkan/runtime/vk_device.h       |   5 +
+ src/vulkan/wsi/wsi_common.c          |   6 +
+ src/vulkan/wsi/wsi_common_haiku.cpp  | 240 +++++++++++++-
+ src/vulkan/wsi/wsi_common_haiku.h    |  41 ++-
+ src/vulkan/wsi/wsi_common_headless.c | 464 ++++++++++++++++++++++++++-
+ src/vulkan/wsi/wsi_common_private.h  |   8 +
+ 8 files changed, 771 insertions(+), 18 deletions(-)
+
+diff --git a/include/vulkan/vulkan_haiku.h b/include/vulkan/vulkan_haiku.h
+index 30e9db6..00a0d43 100644
+--- a/include/vulkan/vulkan_haiku.h
++++ b/include/vulkan/vulkan_haiku.h
+@@ -15,6 +15,13 @@
+  *
+  * The structure type is not one Khronos handed out (it lies in the block
+  * of extension number 1000); it is local to this Haiku port.
++ *
++ * Presenting copies each image into the view through a bitmap. A view in a
++ * BDirectWindow can do better: forward the window's DirectConnected() calls
++ * to vkDirectConnectedHAIKU (from vkGetDeviceProcAddr()), and presents go
++ * straight into the screen's frame buffer on the GPU, clipped to what is
++ * visible of the view, as long as the window is connected. FIFO presents
++ * wait for the vertical blank; IMMEDIATE ones do not.
+  */
+ 
+ #include "vulkan_core.h"
+@@ -32,6 +39,14 @@ typedef struct VkHaikuViewSurfaceCreateInfoHAIKU {
+     void*              view;    /* a BView* in a window; must outlive the surface */
+ } VkHaikuViewSurfaceCreateInfoHAIKU;
+ 
++/* view: the BView* of a VkHaikuViewSurfaceCreateInfoHAIKU; directBufferInfo:
++ * the direct_buffer_info* its BDirectWindow's DirectConnected() got. Call
++ * it from there, before returning. (The view, not the VkSurfaceKHR, names
++ * the surface: the loader would not translate its surface handle for a
++ * command it does not know.) */
++typedef void (VKAPI_PTR *PFN_vkDirectConnectedHAIKU)(VkDevice device,
++    void* view, const void* directBufferInfo);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/vulkan/runtime/vk_device.c b/src/vulkan/runtime/vk_device.c
+index 1b422dc..321ffe4 100644
+--- a/src/vulkan/runtime/vk_device.c
++++ b/src/vulkan/runtime/vk_device.c
+@@ -448,6 +448,11 @@ _vk_device_set_lost(struct vk_device *device,
+    return VK_ERROR_DEVICE_LOST;
+ }
+ 
++#if DETECT_OS_HAIKU
++/* vkDirectConnectedHAIKU (vulkan_haiku.h), which the WSI provides */
++PFN_vkVoidFunction vk_haiku_direct_connected;
++#endif
++
+ PFN_vkVoidFunction
+ vk_device_get_proc_addr(const struct vk_device *device,
+                         const char *name)
+@@ -455,6 +460,11 @@ vk_device_get_proc_addr(const struct vk_device *device,
+    if (device == NULL || name == NULL)
+       return NULL;
+ 
++#if DETECT_OS_HAIKU
++   if (strcmp(name, "vkDirectConnectedHAIKU") == 0)
++      return vk_haiku_direct_connected;
++#endif
++
+    struct vk_instance *instance = device->physical->instance;
+    return vk_device_dispatch_table_get_if_supported(&device->dispatch_table,
+                                                     name,
+diff --git a/src/vulkan/runtime/vk_device.h b/src/vulkan/runtime/vk_device.h
+index fb6221a..b7d7a74 100644
+--- a/src/vulkan/runtime/vk_device.h
++++ b/src/vulkan/runtime/vk_device.h
+@@ -30,6 +30,7 @@
+ #include "vk_physical_device_features.h"
+ #include "vk_pipeline.h"
+ 
++#include "util/detect_os.h"
+ #include "util/list.h"
+ #include "util/simple_mtx.h"
+ #include "util/u_atomic.h"
+@@ -494,6 +495,10 @@ PFN_vkVoidFunction
+ vk_device_get_proc_addr(const struct vk_device *device,
+                         const char *name);
+ 
++#if DETECT_OS_HAIKU
++extern PFN_vkVoidFunction vk_haiku_direct_connected;
++#endif
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index 411ee3e..4f55648 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -371,6 +371,11 @@ wsi_DestroySurfaceKHR(VkInstance _instance,
+    if (!surface)
+       return;
+ 
++#ifdef __HAIKU__
++   if (surface->platform == VK_ICD_WSI_PLATFORM_HEADLESS)
++      wsi_headless_surface_finish(surface);
++#endif
++
+ #ifdef VK_USE_PLATFORM_WAYLAND_KHR
+    if (surface->platform == VK_ICD_WSI_PLATFORM_WAYLAND) {
+       wsi_wl_surface_destroy(surface, _instance, pAllocator);
+@@ -2895,6 +2900,7 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+       if (regions && regions->pRegions)
+          region = &regions->pRegions[i];
+ 
++      swapchain->present_queue = queue;
+       results[i] = swapchain->queue_present(swapchain, image_index,
+                                             image_signal_infos[i].present_id,
+                                             region);
+diff --git a/src/vulkan/wsi/wsi_common_haiku.cpp b/src/vulkan/wsi/wsi_common_haiku.cpp
+index ab220a3..6739a97 100644
+--- a/src/vulkan/wsi/wsi_common_haiku.cpp
++++ b/src/vulkan/wsi/wsi_common_haiku.cpp
+@@ -6,32 +6,80 @@
+ /* Haiku presentation for the headless WSI: each presented image is copied
+  * into a BBitmap and drawn in the application's BView, with the view's
+  * window locked, as Haiku's BGLView does in SwapBuffers().
++ *
++ * In direct mode (the application forwards its BDirectWindow's
++ * DirectConnected() calls), wsi_common_headless.c copies images straight
++ * into the screen's frame buffer instead; this keeps what it needs for
++ * that: the visible parts of the window, and the frame buffer as a dma-buf.
++ * The direct state's lock is held while a direct present is in flight, so
++ * B_DIRECT_STOP (which takes it) returns only after it landed. Nothing
++ * locks a looper while holding it.
+  */
+ 
+ #include "wsi_common_haiku.h"
+ 
++#include <fcntl.h>
+ #include <new>
++#include <stdlib.h>
+ #include <string.h>
++#include <unistd.h>
+ 
++#include <Autolock.h>
+ #include <Bitmap.h>
++#include <DirectWindow.h>
++#include <Locker.h>
++#include <Screen.h>
+ #include <View.h>
+ #include <Window.h>
+ 
++#include <xf86drm.h>
++#include <xf86drmMode.h>
++
+ struct wsi_haiku_presenter {
+    BView *view;
+    BBitmap *bitmap;
+ };
+ 
++struct wsi_haiku_direct {
++   wsi_haiku_direct *next;       /* in sDirectStates */
++   void *view;
++   BLocker lock;
++   bool connected;
++   uint32_t generation;          /* bumped when the frame buffer may change */
++   void *bits;                   /* as DirectConnected() saw it last */
++   clipping_rect window_bounds;  /* the window's content, on screen */
++   clipping_rect *clips;         /* visible parts of the window, on screen */
++   uint32_t clip_count;
++   uint32_t clip_capacity;
++   BPoint view_offset;           /* the view's origin in the window */
++   wsi_haiku_region *regions;
++   uint32_t region_capacity;
++
++   wsi_haiku_direct(void *view)
++      : next(NULL), view(view), lock("wsi direct"), connected(false), generation(0), bits(NULL),
++        clips(NULL), clip_count(0), clip_capacity(0), view_offset(B_ORIGIN),
++        regions(NULL), region_capacity(0)
++   {
++   }
++};
++
+ extern "C" bool
+-wsi_haiku_view_extent(void *_view, uint32_t *width, uint32_t *height)
++wsi_haiku_view_extent(void *_view, struct wsi_haiku_direct *direct,
++                      uint32_t *width, uint32_t *height)
+ {
+    BView *view = (BView *)_view;
+    if (!view->LockLooper())
+       return false;
+    BRect bounds = view->Bounds();
++   BPoint offset = view->ConvertToScreen(B_ORIGIN)
++      - view->Window()->ConvertToScreen(B_ORIGIN);
+    view->UnlockLooper();
+    *width = bounds.IntegerWidth() + 1;
+    *height = bounds.IntegerHeight() + 1;
++   if (direct != NULL) {
++      BAutolock _(direct->lock);
++      direct->view_offset = offset;
++   }
+    return true;
+ }
+ 
+@@ -87,3 +135,193 @@ wsi_haiku_present(struct wsi_haiku_presenter *presenter, const void *pixels,
+    view->UnlockLooper();
+    return true;
+ }
++
++
++/* Every surface's direct state, found by the view */
++static BLocker sDirectStatesLock("wsi direct states");
++static wsi_haiku_direct *sDirectStates;
++
++extern "C" struct wsi_haiku_direct *
++wsi_haiku_direct_create(void *view)
++{
++   wsi_haiku_direct *direct = new(std::nothrow) wsi_haiku_direct(view);
++   if (direct == NULL)
++      return NULL;
++   BAutolock _(sDirectStatesLock);
++   direct->next = sDirectStates;
++   sDirectStates = direct;
++   return direct;
++}
++
++extern "C" void
++wsi_haiku_direct_destroy(struct wsi_haiku_direct *direct)
++{
++   if (direct == NULL)
++      return;
++   sDirectStatesLock.Lock();
++   for (wsi_haiku_direct **link = &sDirectStates; *link != NULL;
++        link = &(*link)->next) {
++      if (*link == direct) {
++         *link = direct->next;
++         break;
++      }
++   }
++   sDirectStatesLock.Unlock();
++   free(direct->clips);
++   free(direct->regions);
++   delete direct;
++}
++
++static void
++direct_connected(wsi_haiku_direct *direct, const direct_buffer_info *info)
++{
++   BAutolock _(direct->lock);
++   switch (info->buffer_state & B_DIRECT_MODE_MASK) {
++   case B_DIRECT_START:
++   case B_DIRECT_MODIFY: {
++      if (info->clip_list_count > direct->clip_capacity) {
++         clipping_rect *clips = (clipping_rect *)realloc(direct->clips,
++            info->clip_list_count * sizeof(clipping_rect));
++         if (clips == NULL) {
++            direct->connected = false;
++            return;
++         }
++         direct->clips = clips;
++         direct->clip_capacity = info->clip_list_count;
++      }
++      memcpy(direct->clips, info->clip_list,
++             info->clip_list_count * sizeof(clipping_rect));
++      direct->clip_count = info->clip_list_count;
++      direct->window_bounds = info->window_bounds;
++      if (info->bits != direct->bits
++          || (info->buffer_state & B_BUFFER_RESET) != 0) {
++         direct->bits = info->bits;
++         direct->generation++;
++      }
++      direct->connected = true;
++      break;
++   }
++   case B_DIRECT_STOP:
++      direct->connected = false;
++      break;
++   }
++}
++
++extern "C" void
++wsi_haiku_direct_connected(void *view, const void *info)
++{
++   if (view == NULL || info == NULL)
++      return;
++   BAutolock _(sDirectStatesLock);
++   for (wsi_haiku_direct *direct = sDirectStates; direct != NULL;
++        direct = direct->next) {
++      if (direct->view == view)
++         direct_connected(direct, (const direct_buffer_info *)info);
++   }
++}
++
++extern "C" bool
++wsi_haiku_direct_begin(struct wsi_haiku_direct *direct,
++                       uint32_t width, uint32_t height,
++                       const struct wsi_haiku_region **_regions,
++                       uint32_t *_count, uint32_t *generation)
++{
++   if (direct == NULL || !direct->lock.Lock())
++      return false;
++   if (!direct->connected) {
++      direct->lock.Unlock();
++      return false;
++   }
++
++   if (direct->clip_count > direct->region_capacity) {
++      wsi_haiku_region *regions = (wsi_haiku_region *)realloc(
++         direct->regions, direct->clip_count * sizeof(wsi_haiku_region));
++      if (regions == NULL) {
++         direct->lock.Unlock();
++         return false;
++      }
++      direct->regions = regions;
++      direct->region_capacity = direct->clip_count;
++   }
++
++   // the view on screen, inclusive
++   int32_t viewLeft = direct->window_bounds.left
++      + (int32_t)direct->view_offset.x;
++   int32_t viewTop = direct->window_bounds.top
++      + (int32_t)direct->view_offset.y;
++   int32_t viewRight = viewLeft + (int32_t)width - 1;
++   int32_t viewBottom = viewTop + (int32_t)height - 1;
++
++   uint32_t count = 0;
++   for (uint32_t i = 0; i < direct->clip_count; i++) {
++      const clipping_rect &clip = direct->clips[i];
++      int32_t left = max_c(clip.left, viewLeft);
++      int32_t top = max_c(clip.top, viewTop);
++      int32_t right = min_c(clip.right, viewRight);
++      int32_t bottom = min_c(clip.bottom, viewBottom);
++      if (left > right || top > bottom)
++         continue;
++      wsi_haiku_region &region = direct->regions[count++];
++      region.src_x = left - viewLeft;
++      region.src_y = top - viewTop;
++      region.dst_x = left;
++      region.dst_y = top;
++      region.width = right - left + 1;
++      region.height = bottom - top + 1;
++   }
++   *_regions = direct->regions;
++   *_count = count;
++   *generation = direct->generation;
++   return true;
++}
++
++extern "C" void
++wsi_haiku_direct_end(struct wsi_haiku_direct *direct)
++{
++   direct->lock.Unlock();
++}
++
++/* The frame buffer's handle comes from the primary node, which hands it out
++ * without being master on linuxkpi; it leaves as a dma-buf. */
++extern "C" int
++wsi_haiku_screen_dma_buf(uint32_t *width, uint32_t *height, uint32_t *pitch)
++{
++   int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
++   if (fd < 0)
++      return -1;
++
++   uint32_t framebufferID = 0;
++   drmModeResPtr resources = drmModeGetResources(fd);
++   for (int i = 0; resources != NULL && i < resources->count_crtcs
++        && framebufferID == 0; i++) {
++      drmModeCrtcPtr crtc = drmModeGetCrtc(fd, resources->crtcs[i]);
++      if (crtc != NULL)
++         framebufferID = crtc->buffer_id;
++      drmModeFreeCrtc(crtc);
++   }
++   drmModeFreeResources(resources);
++
++   int dmaBuf = -1;
++   drmModeFBPtr framebuffer = framebufferID != 0
++      ? drmModeGetFB(fd, framebufferID) : NULL;
++   if (framebuffer != NULL && framebuffer->handle != 0
++       && framebuffer->bpp == 32) {
++      if (drmPrimeHandleToFD(fd, framebuffer->handle, DRM_CLOEXEC | DRM_RDWR,
++                             &dmaBuf) != 0)
++         dmaBuf = -1;
++      drmCloseBufferHandle(fd, framebuffer->handle);
++      *width = framebuffer->width;
++      *height = framebuffer->height;
++      *pitch = framebuffer->pitch;
++   }
++   drmModeFreeFB(framebuffer);
++   close(fd);
++   return dmaBuf;
++}
++
++extern "C" void
++wsi_haiku_wait_retrace(void *_view)
++{
++   BView *view = (BView *)_view;
++   BScreen(view->Window()).WaitForRetrace(100000);
++}
+diff --git a/src/vulkan/wsi/wsi_common_haiku.h b/src/vulkan/wsi/wsi_common_haiku.h
+index f4a8e95..8ff1d3a 100644
+--- a/src/vulkan/wsi/wsi_common_haiku.h
++++ b/src/vulkan/wsi/wsi_common_haiku.h
+@@ -16,8 +16,13 @@ extern "C" {
+ #endif
+ 
+ struct wsi_haiku_presenter;
++struct wsi_haiku_direct;
++
++/* The view's size; also notes where the view sits in its window, for
++ * direct presents (\p direct may be NULL). */
++bool wsi_haiku_view_extent(void *view, struct wsi_haiku_direct *direct,
++                           uint32_t *width, uint32_t *height);
+ 
+-bool wsi_haiku_view_extent(void *view, uint32_t *width, uint32_t *height);
+ struct wsi_haiku_presenter *wsi_haiku_presenter_create(void *view);
+ void wsi_haiku_presenter_destroy(struct wsi_haiku_presenter *presenter);
+ /* Copies BGRA8 rows into the view; false when the view is gone. */
+@@ -25,6 +30,40 @@ bool wsi_haiku_present(struct wsi_haiku_presenter *presenter,
+                        const void *pixels, uint32_t row_pitch,
+                        uint32_t width, uint32_t height);
+ 
++/* Direct mode: what BDirectWindow::DirectConnected() says about a
++ * surface's window (vkDirectConnectedHAIKU). */
++struct wsi_haiku_direct *wsi_haiku_direct_create(void *view);
++void wsi_haiku_direct_destroy(struct wsi_haiku_direct *direct);
++/* For the direct states of the surfaces of \p view */
++void wsi_haiku_direct_connected(void *view, const void *direct_buffer_info);
++
++/* A visible part of the view: from (src_x, src_y) in the image to
++ * (dst_x, dst_y) on the screen. */
++struct wsi_haiku_region {
++   int32_t src_x, src_y;
++   int32_t dst_x, dst_y;
++   uint32_t width, height;
++};
++
++/* While the window is connected: locks the direct state (until
++ * wsi_haiku_direct_end()) and returns the visible parts of a view image of
++ * \p width x \p height, maybe none; the regions stay valid while locked.
++ * \p generation changes whenever the frame buffer may have. False, and
++ * not locked, when presents must go through the view instead. */
++bool wsi_haiku_direct_begin(struct wsi_haiku_direct *direct,
++                            uint32_t width, uint32_t height,
++                            const struct wsi_haiku_region **regions,
++                            uint32_t *count, uint32_t *generation);
++void wsi_haiku_direct_end(struct wsi_haiku_direct *direct);
++
++/* A dma-buf fd for the frame buffer the CRTC shows (XRGB8888, linear), or
++ * -1. */
++int wsi_haiku_screen_dma_buf(uint32_t *width, uint32_t *height,
++                             uint32_t *pitch);
++
++/* Waits for the next vertical blank of the view's screen. */
++void wsi_haiku_wait_retrace(void *view);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/vulkan/wsi/wsi_common_headless.c b/src/vulkan/wsi/wsi_common_headless.c
+index 3384178..fbd26d1 100644
+--- a/src/vulkan/wsi/wsi_common_headless.c
++++ b/src/vulkan/wsi/wsi_common_headless.c
+@@ -34,7 +34,12 @@
+ #include "drm-uapi/drm_fourcc.h"
+ 
+ #ifdef __HAIKU__
++#include <unistd.h>
+ #include <vulkan/vulkan_haiku.h>
++#include <stdio.h>
++#include "util/stack_array.h"
++#include "vk_device.h"
++#include "vk_queue.h"
+ #include "wsi_common_haiku.h"
+ #endif
+ 
+@@ -43,10 +48,13 @@ struct wsi_headless {
+ };
+ 
+ /* Every headless surface Mesa makes; on Haiku it may come with a BView to
+- * present into (vulkan_haiku.h). */
++ * present into (vulkan_haiku.h), and what its BDirectWindow says. */
+ struct wsi_headless_surface {
+    VkIcdSurfaceHeadless base;
+    void *haiku_view;
++#ifdef __HAIKU__
++   struct wsi_haiku_direct *haiku_direct;
++#endif
+ };
+ 
+ static void *
+@@ -55,6 +63,34 @@ wsi_headless_surface_haiku_view(VkIcdSurfaceBase *surface)
+    return ((struct wsi_headless_surface *)surface)->haiku_view;
+ }
+ 
++#ifdef __HAIKU__
++static struct wsi_haiku_direct *
++wsi_headless_surface_haiku_direct(VkIcdSurfaceBase *surface)
++{
++   return ((struct wsi_headless_surface *)surface)->haiku_direct;
++}
++
++/* vkDirectConnectedHAIKU (vulkan_haiku.h) */
++static VKAPI_ATTR void VKAPI_CALL
++wsi_headless_direct_connected(VkDevice device, void *view,
++                              const void *direct_buffer_info)
++{
++   wsi_haiku_direct_connected(view, direct_buffer_info);
++}
++
++void
++wsi_headless_surface_finish(VkIcdSurfaceBase *surface)
++{
++   wsi_haiku_direct_destroy(wsi_headless_surface_haiku_direct(surface));
++}
++
++/* What presenting into a view offers: FIFO waits for the vertical blank. */
++static const VkPresentModeKHR haiku_present_modes[] = {
++   VK_PRESENT_MODE_FIFO_KHR,
++   VK_PRESENT_MODE_IMMEDIATE_KHR,
++};
++#endif
++
+ /* What a Haiku view takes: B_RGB32 is BGRA in memory. */
+ static const VkFormat haiku_formats[] = {
+    VK_FORMAT_B8G8R8A8_SRGB,
+@@ -95,13 +131,14 @@ wsi_headless_surface_get_capabilities(VkIcdSurfaceBase *surface,
+    caps->surfaceCapabilities.currentExtent = (VkExtent2D) { -1, -1 };
+ 
+ #ifdef __HAIKU__
+-   /* Presenting into a view copies on the CPU, synchronously; two images
+-    * are plenty, and the view decides the size. */
++   /* Presenting into a view is synchronous; two images are plenty, and the
++    * view decides the size. */
+    void *view = wsi_headless_surface_haiku_view(surface);
+    if (view != NULL) {
+       uint32_t width, height;
+       caps->surfaceCapabilities.minImageCount = 2;
+-      if (!wsi_haiku_view_extent(view, &width, &height))
++      if (!wsi_haiku_view_extent(view, wsi_headless_surface_haiku_direct(surface),
++                                 &width, &height))
+          return VK_ERROR_SURFACE_LOST_KHR;
+       caps->surfaceCapabilities.currentExtent = (VkExtent2D) { width, height };
+    }
+@@ -331,6 +368,20 @@ wsi_headless_surface_get_present_modes(VkIcdSurfaceBase *surface,
+                                        uint32_t* pPresentModeCount,
+                                        VkPresentModeKHR* pPresentModes)
+ {
++#ifdef __HAIKU__
++   if (wsi_headless_surface_haiku_view(surface) != NULL) {
++      if (pPresentModes == NULL) {
++         *pPresentModeCount = ARRAY_SIZE(haiku_present_modes);
++         return VK_SUCCESS;
++      }
++      *pPresentModeCount = MIN2(*pPresentModeCount,
++                                ARRAY_SIZE(haiku_present_modes));
++      typed_memcpy(pPresentModes, haiku_present_modes, *pPresentModeCount);
++      return *pPresentModeCount < ARRAY_SIZE(haiku_present_modes)
++         ? VK_INCOMPLETE : VK_SUCCESS;
++   }
++#endif
++
+    if (pPresentModes == NULL) {
+       *pPresentModeCount = ARRAY_SIZE(present_modes);
+       return VK_SUCCESS;
+@@ -385,7 +436,27 @@ struct wsi_headless_swapchain {
+ #ifdef __HAIKU__
+    /* when presenting into a Haiku view */
+    struct wsi_haiku_presenter *haiku_presenter;
++   struct wsi_haiku_direct *haiku_direct;   /* the surface's */
++   void *haiku_view;
+    VkExtent2D extent;
++
++   /* copies out of the images, on the present queue */
++   uint32_t copy_family;
++   VkCommandPool copy_pool;
++   VkCommandBuffer copy_commands;
++   VkFence copy_fence;
++
++   /* where presents through the view copy to first */
++   VkBuffer staging;
++   VkDeviceMemory staging_memory;
++   void *staging_map;
++
++   /* the screen's frame buffer, for direct presents */
++   VkBuffer screen;
++   VkDeviceMemory screen_memory;
++   uint32_t screen_width, screen_height, screen_pitch;
++   uint32_t screen_generation;
++   bool screen_failed;
+ #endif
+    struct wsi_headless_image images[0];
+ };
+@@ -459,6 +530,324 @@ wsi_headless_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
+    }
+ }
+ 
++#ifdef __HAIKU__
++static void
++haiku_release_screen(struct wsi_headless_swapchain *chain)
++{
++   const struct wsi_device *wsi = chain->base.wsi;
++   if (chain->screen != VK_NULL_HANDLE)
++      wsi->DestroyBuffer(chain->base.device, chain->screen, &chain->base.alloc);
++   if (chain->screen_memory != VK_NULL_HANDLE)
++      wsi->FreeMemory(chain->base.device, chain->screen_memory,
++                      &chain->base.alloc);
++   chain->screen = VK_NULL_HANDLE;
++   chain->screen_memory = VK_NULL_HANDLE;
++}
++
++/* A buffer over the screen's frame buffer, imported as a dma-buf. */
++static VkResult
++haiku_import_screen(struct wsi_headless_swapchain *chain)
++{
++   const struct wsi_device *wsi = chain->base.wsi;
++   VkDevice device = chain->base.device;
++   uint32_t width, height, pitch;
++   int fd = wsi_haiku_screen_dma_buf(&width, &height, &pitch);
++   if (fd < 0)
++      return VK_ERROR_FEATURE_NOT_PRESENT;
++
++   const VkExternalMemoryBufferCreateInfo external_info = {
++      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
++      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++   };
++   const VkBufferCreateInfo buffer_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .pNext = &external_info,
++      .size = (VkDeviceSize)pitch * height,
++      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++   };
++   VkResult result = wsi->CreateBuffer(device, &buffer_info, &chain->base.alloc,
++                                       &chain->screen);
++   if (result != VK_SUCCESS) {
++      close(fd);
++      return result;
++   }
++
++   VkMemoryRequirements requirements;
++   wsi->GetBufferMemoryRequirements(device, chain->screen, &requirements);
++   const VkMemoryDedicatedAllocateInfo dedicated_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
++      .buffer = chain->screen,
++   };
++   const VkImportMemoryFdInfoKHR import_info = {
++      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
++      .pNext = &dedicated_info,
++      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++      .fd = fd,
++   };
++   const VkMemoryAllocateInfo memory_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .pNext = &import_info,
++      .allocationSize = requirements.size,
++      .memoryTypeIndex =
++         wsi_select_device_memory_type(wsi, requirements.memoryTypeBits),
++   };
++   result = wsi->AllocateMemory(device, &memory_info, &chain->base.alloc,
++                                &chain->screen_memory);
++   if (result != VK_SUCCESS) {
++      /* a successful import owns the fd */
++      close(fd);
++      haiku_release_screen(chain);
++      return result;
++   }
++   result = wsi->BindBufferMemory(device, chain->screen, chain->screen_memory,
++                                  0);
++   if (result != VK_SUCCESS) {
++      haiku_release_screen(chain);
++      return result;
++   }
++   chain->screen_width = width;
++   chain->screen_height = height;
++   chain->screen_pitch = pitch;
++   return VK_SUCCESS;
++}
++
++/* A host-visible buffer for one image's rows, for presents through the
++ * view. */
++static VkResult
++haiku_create_staging(struct wsi_headless_swapchain *chain)
++{
++   const struct wsi_device *wsi = chain->base.wsi;
++   VkDevice device = chain->base.device;
++   const VkBufferCreateInfo buffer_info = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++      .size = (VkDeviceSize)chain->extent.width * chain->extent.height * 4,
++      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++   };
++   VkResult result = wsi->CreateBuffer(device, &buffer_info, &chain->base.alloc,
++                                       &chain->staging);
++   if (result != VK_SUCCESS)
++      return result;
++   VkMemoryRequirements requirements;
++   wsi->GetBufferMemoryRequirements(device, chain->staging, &requirements);
++   const VkMemoryAllocateInfo memory_info = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .allocationSize = requirements.size,
++      .memoryTypeIndex = wsi_select_memory_type(wsi,
++         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
++         0, requirements.memoryTypeBits),
++   };
++   result = wsi->AllocateMemory(device, &memory_info, &chain->base.alloc,
++                                &chain->staging_memory);
++   if (result != VK_SUCCESS)
++      return result;
++   result = wsi->BindBufferMemory(device, chain->staging, chain->staging_memory,
++                                  0);
++   if (result != VK_SUCCESS)
++      return result;
++   return wsi->MapMemory(device, chain->staging_memory, 0, VK_WHOLE_SIZE, 0,
++                         &chain->staging_map);
++}
++
++/* Copies \p count regions of an image into \p buffer on the present queue,
++ * after everything submitted to it so far, and waits until they are there.
++ */
++static VkResult
++haiku_copy_image(struct wsi_headless_swapchain *chain, VkImage image,
++                 VkBuffer buffer, const VkBufferImageCopy *regions,
++                 uint32_t count)
++{
++   const struct wsi_device *wsi = chain->base.wsi;
++   VkDevice device = chain->base.device;
++   struct vk_queue *queue = chain->base.present_queue;
++   VkResult result;
++
++   if (chain->copy_pool == VK_NULL_HANDLE
++       || chain->copy_family != queue->queue_family_index) {
++      if (chain->copy_pool != VK_NULL_HANDLE)
++         wsi->DestroyCommandPool(device, chain->copy_pool, &chain->base.alloc);
++      chain->copy_pool = VK_NULL_HANDLE;
++      const VkCommandPoolCreateInfo pool_info = {
++         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
++         .queueFamilyIndex = queue->queue_family_index,
++      };
++      result = wsi->CreateCommandPool(device, &pool_info, &chain->base.alloc,
++                                      &chain->copy_pool);
++      if (result != VK_SUCCESS)
++         return result;
++      chain->copy_family = queue->queue_family_index;
++      const VkCommandBufferAllocateInfo commands_info = {
++         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++         .commandPool = chain->copy_pool,
++         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++         .commandBufferCount = 1,
++      };
++      result = wsi->AllocateCommandBuffers(device, &commands_info,
++                                           &chain->copy_commands);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++   if (chain->copy_fence == VK_NULL_HANDLE) {
++      const VkFenceCreateInfo fence_info = {
++         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
++      };
++      result = wsi->CreateFence(device, &fence_info, &chain->base.alloc,
++                                &chain->copy_fence);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   const VkCommandBufferBeginInfo begin_info = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++   };
++   wsi->BeginCommandBuffer(chain->copy_commands, &begin_info);
++   VkImageMemoryBarrier barrier = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++      .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
++      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = image,
++      .subresourceRange = {
++         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++         .levelCount = 1,
++         .layerCount = 1,
++      },
++   };
++   wsi->CmdPipelineBarrier(chain->copy_commands,
++                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
++                           1, &barrier);
++   wsi->CmdCopyImageToBuffer(chain->copy_commands, image,
++                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer,
++                             count, regions);
++   barrier.srcAccessMask = 0;
++   barrier.dstAccessMask = 0;
++   barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++   barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++   const VkMemoryBarrier host_barrier = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++   };
++   wsi->CmdPipelineBarrier(chain->copy_commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                           VK_PIPELINE_STAGE_HOST_BIT
++                           | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
++                           1, &host_barrier, 0, NULL, 1, &barrier);
++   result = wsi->EndCommandBuffer(chain->copy_commands);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkCommandBufferSubmitInfo commands = {
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
++      .commandBuffer = chain->copy_commands,
++   };
++   const VkSubmitInfo2 submit = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
++      .commandBufferInfoCount = 1,
++      .pCommandBufferInfos = &commands,
++   };
++   result = wsi->QueueSubmit2(vk_queue_to_handle(queue), 1, &submit,
++                              chain->copy_fence);
++   if (result != VK_SUCCESS)
++      return result;
++   result = wsi->WaitForFences(device, 1, &chain->copy_fence, true, UINT64_MAX);
++   wsi->ResetFences(device, 1, &chain->copy_fence);
++   return result;
++}
++
++/* Straight into the frame buffer while the window is connected (true when
++ * done so), else false and nothing done. */
++static bool
++haiku_present_direct(struct wsi_headless_swapchain *chain, VkImage image,
++                     VkResult *result)
++{
++   const struct wsi_haiku_region *regions;
++   uint32_t count, generation;
++   if (chain->screen_failed
++       || !wsi_haiku_direct_begin(chain->haiku_direct, chain->extent.width,
++                                  chain->extent.height, &regions, &count,
++                                  &generation))
++      return false;
++
++   if (chain->screen == VK_NULL_HANDLE
++       || generation != chain->screen_generation) {
++      haiku_release_screen(chain);
++      if (haiku_import_screen(chain) != VK_SUCCESS) {
++         fprintf(stderr, "wsi: no direct mode, presents go through the "
++                 "view\n");
++         chain->screen_failed = true;
++         wsi_haiku_direct_end(chain->haiku_direct);
++         return false;
++      }
++      static bool told;
++      if (!told) {
++         fprintf(stderr, "wsi: direct mode, presents go straight to the "
++                 "frame buffer\n");
++         told = true;
++      }
++      chain->screen_generation = generation;
++   }
++
++   STACK_ARRAY(VkBufferImageCopy, copies, MAX2(count, 1));
++   uint32_t copy_count = 0;
++   for (uint32_t i = 0; i < count; i++) {
++      const struct wsi_haiku_region *region = &regions[i];
++      if (region->dst_x < 0 || region->dst_y < 0
++          || region->dst_x + region->width > chain->screen_width
++          || region->dst_y + region->height > chain->screen_height)
++         continue;
++      copies[copy_count++] = (VkBufferImageCopy) {
++         .bufferOffset = (VkDeviceSize)region->dst_y * chain->screen_pitch
++            + (VkDeviceSize)region->dst_x * 4,
++         .bufferRowLength = chain->screen_pitch / 4,
++         .imageSubresource = {
++            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++            .layerCount = 1,
++         },
++         .imageOffset = { region->src_x, region->src_y, 0 },
++         .imageExtent = { region->width, region->height, 1 },
++      };
++   }
++   *result = copy_count > 0
++      ? haiku_copy_image(chain, image, chain->screen, copies, copy_count)
++      : VK_SUCCESS;
++   STACK_ARRAY_FINISH(copies);
++   wsi_haiku_direct_end(chain->haiku_direct);
++   return true;
++}
++
++/* Through the view: a copy into the staging buffer, then a bitmap. */
++static VkResult
++haiku_present_view(struct wsi_headless_swapchain *chain, VkImage image)
++{
++   if (chain->staging_map == NULL) {
++      VkResult result = haiku_create_staging(chain);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++   const VkBufferImageCopy copy = {
++      .imageSubresource = {
++         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++         .layerCount = 1,
++      },
++      .imageExtent = { chain->extent.width, chain->extent.height, 1 },
++   };
++   VkResult result = haiku_copy_image(chain, image, chain->staging, &copy, 1);
++   if (result != VK_SUCCESS)
++      return result;
++   bool shown = wsi_haiku_present(chain->haiku_presenter, chain->staging_map,
++                                  chain->extent.width * 4, chain->extent.width,
++                                  chain->extent.height);
++   return shown ? VK_SUCCESS : VK_ERROR_SURFACE_LOST_KHR;
++}
++#endif
++
+ static VkResult
+ wsi_headless_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
+                                      uint32_t image_index,
+@@ -472,17 +861,16 @@ wsi_headless_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
+ 
+ #ifdef __HAIKU__
+    if (chain->haiku_presenter != NULL) {
+-      /* The image reaches its CPU-visible copy by a blit on the GPU; only
+-       * software drivers have the common code wait for it. */
+-      struct wsi_image *image = &chain->images[image_index].base;
+-      chain->base.wsi->WaitForFences(chain->base.device, 1,
+-                                     &chain->base.fences[image_index],
+-                                     true, UINT64_MAX);
+-      bool shown = wsi_haiku_present(chain->haiku_presenter, image->cpu_map,
+-                                     image->row_pitches[0], chain->extent.width,
+-                                     chain->extent.height);
++      /* The images are the GPU's own; a present copies one out on the
++       * present queue, after the rendering it waits for. */
++      VkImage image = chain->images[image_index].base.image;
++      if (chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR)
++         wsi_haiku_wait_retrace(chain->haiku_view);
++      VkResult result;
++      if (!haiku_present_direct(chain, image, &result))
++         result = haiku_present_view(chain, image);
+       chain->images[image_index].busy_on_host = false;
+-      return shown ? VK_SUCCESS : VK_ERROR_SURFACE_LOST_KHR;
++      return result;
+    }
+ #endif
+ 
+@@ -515,6 +903,19 @@ wsi_headless_swapchain_destroy(struct wsi_swapchain *wsi_chain,
+    wsi_swapchain_finish(&chain->base);
+ 
+ #ifdef __HAIKU__
++   if (chain->haiku_presenter != NULL) {
++      const struct wsi_device *wsi = chain->base.wsi;
++      VkDevice device = chain->base.device;
++      haiku_release_screen(chain);
++      if (chain->staging != VK_NULL_HANDLE)
++         wsi->DestroyBuffer(device, chain->staging, &chain->base.alloc);
++      if (chain->staging_memory != VK_NULL_HANDLE)
++         wsi->FreeMemory(device, chain->staging_memory, &chain->base.alloc);
++      if (chain->copy_fence != VK_NULL_HANDLE)
++         wsi->DestroyFence(device, chain->copy_fence, &chain->base.alloc);
++      if (chain->copy_pool != VK_NULL_HANDLE)
++         wsi->DestroyCommandPool(device, chain->copy_pool, &chain->base.alloc);
++   }
+    wsi_haiku_presenter_destroy(chain->haiku_presenter);
+ #endif
+ 
+@@ -573,7 +974,14 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+    struct wsi_cpu_image_params cpu_params;
+    struct wsi_drm_image_params drm_params;
+    void *haiku_view = wsi_headless_surface_haiku_view(icd_surface);
+-   if (wsi_device->sw || haiku_view != NULL) {
++   if (haiku_view != NULL && !wsi_device->sw) {
++      /* The GPU's own images, which presents copy out of */
++      drm_params = (struct wsi_drm_image_params) {
++         .base.image_type = WSI_IMAGE_TYPE_DRM,
++         .same_gpu = true,
++      };
++      image_params = &drm_params.base;
++   } else if (wsi_device->sw || haiku_view != NULL) {
+       cpu_params = (struct wsi_cpu_image_params) {
+          .base.image_type = WSI_IMAGE_TYPE_CPU,
+       };
+@@ -599,8 +1007,21 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+       goto fail_free_chain;
+ 
+ #ifdef __HAIKU__
++   if (haiku_view != NULL && !wsi_device->sw) {
++      /* Presents copy out of the images; nobody else shares them, so they
++       * need no sync files attached either. */
++      chain->base.image_info.create.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++      chain->base.image_info.usage2.usage |= VK_IMAGE_USAGE_2_TRANSFER_SRC_BIT_KHR;
++      if (chain->base.dma_buf_semaphore != VK_NULL_HANDLE) {
++         wsi_device->DestroySemaphore(device, chain->base.dma_buf_semaphore,
++                                      &chain->base.alloc);
++         chain->base.dma_buf_semaphore = VK_NULL_HANDLE;
++      }
++   }
+    if (haiku_view != NULL) {
+       chain->haiku_presenter = wsi_haiku_presenter_create(haiku_view);
++      chain->haiku_direct = wsi_headless_surface_haiku_direct(icd_surface);
++      chain->haiku_view = haiku_view;
+       chain->extent = pCreateInfo->imageExtent;
+       if (chain->haiku_presenter == NULL) {
+          wsi_swapchain_finish(&chain->base);
+@@ -669,6 +1090,10 @@ wsi_headless_init_wsi(struct wsi_device *wsi_device,
+ 
+    wsi_device->wsi[VK_ICD_WSI_PLATFORM_HEADLESS] = &wsi->base;
+ 
++#ifdef __HAIKU__
++   vk_haiku_direct_connected = (PFN_vkVoidFunction)wsi_headless_direct_connected;
++#endif
++
+    return VK_SUCCESS;
+ 
+ fail:
+@@ -710,8 +1135,15 @@ VkResult wsi_CreateHeadlessSurfaceEXT(
+    const VkHaikuViewSurfaceCreateInfoHAIKU *haiku_info =
+       (const VkHaikuViewSurfaceCreateInfoHAIKU *)__vk_find_struct(
+          (void *)pCreateInfo->pNext, VK_STRUCTURE_TYPE_HAIKU_VIEW_SURFACE_CREATE_INFO_HAIKU);
+-   if (haiku_info != NULL)
++   surface->haiku_direct = NULL;
++   if (haiku_info != NULL) {
+       surface->haiku_view = haiku_info->view;
++      surface->haiku_direct = wsi_haiku_direct_create(haiku_info->view);
++      if (surface->haiku_direct == NULL) {
++         vk_free2(&instance->alloc, pAllocator, surface);
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      }
++   }
+ #endif
+ 
+    *pSurface = VkIcdSurfaceBase_to_handle(&surface->base.base);
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index 3d2cd7d..c9f5133 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -300,6 +300,9 @@ struct wsi_swapchain {
+    /* Command pools, one per queue family */
+    VkCommandPool *cmd_pools;
+ 
++   /* The queue of the present queue_present() is called for */
++   struct vk_queue *present_queue;
++
+    VkResult (*destroy)(struct wsi_swapchain *swapchain,
+                        const VkAllocationCallbacks *pAllocator);
+    struct wsi_image *(*get_wsi_image)(struct wsi_swapchain *swapchain,
+@@ -370,6 +373,11 @@ wsi_swapchain_get_present_mode(struct wsi_device *wsi,
+ 
+ void wsi_swapchain_finish(struct wsi_swapchain *chain);
+ 
++#ifdef __HAIKU__
++/* Frees what a headless surface has for its Haiku view. */
++void wsi_headless_surface_finish(VkIcdSurfaceBase *surface);
++#endif
++
+ uint32_t
+ wsi_select_memory_type(const struct wsi_device *wsi,
+                        VkMemoryPropertyFlags req_flags,

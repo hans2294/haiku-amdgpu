@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 10:24:33 +0100
+Subject: [PATCH] vulkan_haiku.h: vkDirectConnectedHAIKU
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/vulkan/vulkan_haiku.h | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/include/vulkan/vulkan_haiku.h b/include/vulkan/vulkan_haiku.h
+index 30e9db6..00a0d43 100644
+--- a/include/vulkan/vulkan_haiku.h
++++ b/include/vulkan/vulkan_haiku.h
+@@ -15,6 +15,13 @@
+  *
+  * The structure type is not one Khronos handed out (it lies in the block
+  * of extension number 1000); it is local to this Haiku port.
++ *
++ * Presenting copies each image into the view through a bitmap. A view in a
++ * BDirectWindow can do better: forward the window's DirectConnected() calls
++ * to vkDirectConnectedHAIKU (from vkGetDeviceProcAddr()), and presents go
++ * straight into the screen's frame buffer on the GPU, clipped to what is
++ * visible of the view, as long as the window is connected. FIFO presents
++ * wait for the vertical blank; IMMEDIATE ones do not.
+  */
+ 
+ #include "vulkan_core.h"
+@@ -32,6 +39,14 @@ typedef struct VkHaikuViewSurfaceCreateInfoHAIKU {
+     void*              view;    /* a BView* in a window; must outlive the surface */
+ } VkHaikuViewSurfaceCreateInfoHAIKU;
+ 
++/* view: the BView* of a VkHaikuViewSurfaceCreateInfoHAIKU; directBufferInfo:
++ * the direct_buffer_info* its BDirectWindow's DirectConnected() got. Call
++ * it from there, before returning. (The view, not the VkSurfaceKHR, names
++ * the surface: the loader would not translate its surface handle for a
++ * command it does not know.) */
++typedef void (VKAPI_PTR *PFN_vkDirectConnectedHAIKU)(VkDevice device,
++    void* view, const void* directBufferInfo);
++
+ #ifdef __cplusplus
+ }
+ #endif

@@ -1,0 +1,3559 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:38:23 +0100
+Subject: [PATCH] Test programs for the driver, libdrm, GL and Vulkan
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/bin/Jamfile                        |   8 +
+ src/bin/amdgputest/Jamfile             |  10 +
+ src/bin/amdgputest/amdgputest.cpp      | 426 +++++++++++++
+ src/bin/amdgputest/compat/sys/ioccom.h |  31 +
+ src/bin/gltest/Jamfile                 |   9 +
+ src/bin/gltest/gltest.c                | 257 ++++++++
+ src/bin/kmstest/Jamfile                |  15 +
+ src/bin/kmstest/kmstest.c              | 271 ++++++++
+ src/bin/libdrmtest/Jamfile             |  16 +
+ src/bin/libdrmtest/libdrmtest.c        | 439 +++++++++++++
+ src/bin/tearingtest/Jamfile            |   6 +
+ src/bin/tearingtest/tearingtest.cpp    |  91 +++
+ src/bin/vkheadless/Jamfile             |   9 +
+ src/bin/vkheadless/fill.comp           |  10 +
+ src/bin/vkheadless/fill_spv.h          |  39 ++
+ src/bin/vkheadless/vkheadless.c        | 495 +++++++++++++++
+ src/bin/vkwindow/Jamfile               |  10 +
+ src/bin/vkwindow/triangle.frag         |   7 +
+ src/bin/vkwindow/triangle.vert         |  15 +
+ src/bin/vkwindow/triangle_frag.h       |  21 +
+ src/bin/vkwindow/triangle_vert.h       |  81 +++
+ src/bin/vkwindow/vkwindow.cpp          | 829 +++++++++++++++++++++++++
+ src/bin/vsynctest/Jamfile              |  11 +
+ src/bin/vsynctest/vsynctest.cpp        | 248 ++++++++
+ 24 files changed, 3354 insertions(+)
+ create mode 100644 src/bin/amdgputest/Jamfile
+ create mode 100644 src/bin/amdgputest/amdgputest.cpp
+ create mode 100644 src/bin/amdgputest/compat/sys/ioccom.h
+ create mode 100644 src/bin/gltest/Jamfile
+ create mode 100644 src/bin/gltest/gltest.c
+ create mode 100644 src/bin/kmstest/Jamfile
+ create mode 100644 src/bin/kmstest/kmstest.c
+ create mode 100644 src/bin/libdrmtest/Jamfile
+ create mode 100644 src/bin/libdrmtest/libdrmtest.c
+ create mode 100644 src/bin/tearingtest/Jamfile
+ create mode 100644 src/bin/tearingtest/tearingtest.cpp
+ create mode 100644 src/bin/vkheadless/Jamfile
+ create mode 100644 src/bin/vkheadless/fill.comp
+ create mode 100644 src/bin/vkheadless/fill_spv.h
+ create mode 100644 src/bin/vkheadless/vkheadless.c
+ create mode 100644 src/bin/vkwindow/Jamfile
+ create mode 100644 src/bin/vkwindow/triangle.frag
+ create mode 100644 src/bin/vkwindow/triangle.vert
+ create mode 100644 src/bin/vkwindow/triangle_frag.h
+ create mode 100644 src/bin/vkwindow/triangle_vert.h
+ create mode 100644 src/bin/vkwindow/vkwindow.cpp
+ create mode 100644 src/bin/vsynctest/Jamfile
+ create mode 100644 src/bin/vsynctest/vsynctest.cpp
+
+diff --git a/src/bin/Jamfile b/src/bin/Jamfile
+index 5214328c81..dcd9246ac8 100644
+--- a/src/bin/Jamfile
++++ b/src/bin/Jamfile
+@@ -247,6 +247,14 @@ DoCatalogs filepanel
+ 
+ SubInclude HAIKU_TOP src bin acpi_call ;
+ SubInclude HAIKU_TOP src bin addattr ;
++SubInclude HAIKU_TOP src bin amdgputest ;
++SubInclude HAIKU_TOP src bin gltest ;
++SubInclude HAIKU_TOP src bin kmstest ;
++SubInclude HAIKU_TOP src bin libdrmtest ;
++SubInclude HAIKU_TOP src bin vkheadless ;
++SubInclude HAIKU_TOP src bin vkwindow ;
++SubInclude HAIKU_TOP src bin tearingtest ;
++SubInclude HAIKU_TOP src bin vsynctest ;
+ SubInclude HAIKU_TOP src bin bfs_tools ;
+ SubInclude HAIKU_TOP src bin cddb_lookup ;
+ SubInclude HAIKU_TOP src bin consoled ;
+diff --git a/src/bin/amdgputest/Jamfile b/src/bin/amdgputest/Jamfile
+new file mode 100644
+index 0000000000..4eb9cd145f
+--- /dev/null
++++ b/src/bin/amdgputest/Jamfile
+@@ -0,0 +1,10 @@
++SubDir HAIKU_TOP src bin amdgputest ;
++
++# Linux's DRM and amdgpu UAPI headers, unchanged, with Linux's ioctl
++# encoding from compat/sys/ioccom.h.
++SubDirSysHdrs [ FDirName $(SUBDIR) compat ] ;
++SubDirSysHdrs [ FDirName $(HAIKU_TOP) .. linux-6.12 include uapi drm ] ;
++
++Application amdgputest :
++	amdgputest.cpp
++	;
+diff --git a/src/bin/amdgputest/amdgputest.cpp b/src/bin/amdgputest/amdgputest.cpp
+new file mode 100644
+index 0000000000..68ab8f6ffb
+--- /dev/null
++++ b/src/bin/amdgputest/amdgputest.cpp
+@@ -0,0 +1,426 @@
++/*
++ * Copyright 2026, hans2294.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*!	Talks to Linux's amdgpu through /dev/dri the way libdrm does, with the
++	unchanged Linux UAPI: version, device and memory info, sensors, a
++	context, a buffer object's life (create, mapping, GPU VA map, close),
++	and a copy on the GPU: SDMA copies a VRAM buffer the CPU filled into a
++	GTT buffer, submitted with the CS ioctl and waited for with WAIT_CS.
++
++	amdgputest [/dev/dri/renderD128]
++*/
++
++
++#include <OS.h>
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++// The kernel tree's UAPI headers, before headers_install strips this
++#define __user
++#include <drm.h>
++#include <amdgpu_drm.h>
++
++#include "../../libs/compat/linuxkpi/include/linuxkpi/uapi.h"
++
++
++static int sFailures;
++
++
++static bool
++check(const char* what, int result)
++{
++	if (result == 0) {
++		printf("ok    %s\n", what);
++		return true;
++	}
++	printf("FAIL  %s: %s\n", what, strerror(errno));
++	sFailures++;
++	return false;
++}
++
++
++static int
++drm_ioctl(int fd, unsigned long command, void* argument)
++{
++	int result;
++	do {
++		result = ioctl(fd, command, argument);
++	} while (result == -1 && (errno == EINTR || errno == EAGAIN));
++	return result;
++}
++
++
++static int
++query_info(int fd, uint32_t query, void* buffer, uint32_t size,
++	uint32_t extra = 0)
++{
++	drm_amdgpu_info request = {};
++	request.return_pointer = (uintptr_t)buffer;
++	request.return_size = size;
++	request.query = query;
++	if (query == AMDGPU_INFO_SENSOR)
++		request.sensor_info.type = extra;
++	return drm_ioctl(fd, DRM_IOCTL_AMDGPU_INFO, &request);
++}
++
++
++static void
++test_version(int fd)
++{
++	char name[64] = {}, date[64] = {}, description[128] = {};
++	drm_version version = {};
++	version.name = name;
++	version.name_len = sizeof(name) - 1;
++	version.date = date;
++	version.date_len = sizeof(date) - 1;
++	version.desc = description;
++	version.desc_len = sizeof(description) - 1;
++	if (check("DRM_IOCTL_VERSION", drm_ioctl(fd, DRM_IOCTL_VERSION, &version)))
++		printf("      %s %d.%d.%d: %s\n", name, version.version_major,
++			version.version_minor, version.version_patchlevel, description);
++}
++
++
++static void
++test_info(int fd)
++{
++	drm_amdgpu_info_device device = {};
++	if (check("AMDGPU_INFO_DEV_INFO", query_info(fd, AMDGPU_INFO_DEV_INFO,
++			&device, sizeof(device)))) {
++		printf("      device %#x rev %#x family %u, %u SE x %u SA, %u CUs, "
++			"%u RBs\n", device.device_id, device.pci_rev, device.family,
++			device.num_shader_engines, device.num_shader_arrays_per_engine,
++			device.cu_active_number, device.num_rb_pipes);
++		printf("      engine clock %llu MHz, memory clock %llu MHz, "
++			"VRAM type %u, %u bit, wave size %u, PCIe gen %u\n",
++			(unsigned long long)device.max_engine_clock / 1000,
++			(unsigned long long)device.max_memory_clock / 1000,
++			device.vram_type, device.vram_bit_width, device.wave_front_size,
++			device.pcie_gen);
++		printf("      GPU VA %#llx - %#llx\n",
++			(unsigned long long)device.virtual_address_offset,
++			(unsigned long long)device.virtual_address_max);
++	}
++
++	drm_amdgpu_memory_info memory = {};
++	if (check("AMDGPU_INFO_MEMORY", query_info(fd, AMDGPU_INFO_MEMORY, &memory,
++			sizeof(memory)))) {
++		printf("      VRAM %llu MiB (%llu usable), CPU visible %llu MiB, "
++			"GTT %llu MiB\n",
++			(unsigned long long)memory.vram.total_heap_size >> 20,
++			(unsigned long long)memory.vram.usable_heap_size >> 20,
++			(unsigned long long)memory.cpu_accessible_vram.total_heap_size >> 20,
++			(unsigned long long)memory.gtt.total_heap_size >> 20);
++	}
++
++	drm_amdgpu_info_firmware firmware = {};
++	drm_amdgpu_info request = {};
++	request.return_pointer = (uintptr_t)&firmware;
++	request.return_size = sizeof(firmware);
++	request.query = AMDGPU_INFO_FW_VERSION;
++	request.query_fw.fw_type = AMDGPU_INFO_FW_GFX_ME;
++	if (check("AMDGPU_INFO_FW_VERSION (gfx me)",
++			drm_ioctl(fd, DRM_IOCTL_AMDGPU_INFO, &request)))
++		printf("      version %#x, feature %u\n", firmware.ver,
++			firmware.feature);
++
++	uint32_t value = 0;
++	if (check("AMDGPU_INFO_SENSOR (GPU temperature)", query_info(fd,
++			AMDGPU_INFO_SENSOR, &value, sizeof(value),
++			AMDGPU_INFO_SENSOR_GPU_TEMP)))
++		printf("      %.1f C\n", value / 1000.0);
++	if (check("AMDGPU_INFO_SENSOR (shader clock)", query_info(fd,
++			AMDGPU_INFO_SENSOR, &value, sizeof(value),
++			AMDGPU_INFO_SENSOR_GFX_SCLK)))
++		printf("      %u MHz\n", value);
++}
++
++
++static void
++test_context(int fd)
++{
++	drm_amdgpu_ctx context = {};
++	context.in.op = AMDGPU_CTX_OP_ALLOC_CTX;
++	if (!check("AMDGPU_CTX alloc", drm_ioctl(fd, DRM_IOCTL_AMDGPU_CTX,
++			&context)))
++		return;
++	uint32_t id = context.out.alloc.ctx_id;
++	printf("      context %u\n", id);
++
++	memset(&context, 0, sizeof(context));
++	context.in.op = AMDGPU_CTX_OP_FREE_CTX;
++	context.in.ctx_id = id;
++	check("AMDGPU_CTX free", drm_ioctl(fd, DRM_IOCTL_AMDGPU_CTX, &context));
++}
++
++
++static uint32_t
++create_buffer(int fd, uint64_t size, uint32_t domain, uint64_t flags,
++	const char* what)
++{
++	drm_amdgpu_gem_create create = {};
++	create.in.bo_size = size;
++	create.in.alignment = 4096;
++	create.in.domains = domain;
++	create.in.domain_flags = flags;
++	if (!check(what, drm_ioctl(fd, DRM_IOCTL_AMDGPU_GEM_CREATE, &create)))
++		return 0;
++	return create.out.handle;
++}
++
++
++static void
++close_buffer(int fd, uint32_t handle)
++{
++	drm_gem_close close = {};
++	close.handle = handle;
++	check("DRM_IOCTL_GEM_CLOSE", drm_ioctl(fd, DRM_IOCTL_GEM_CLOSE, &close));
++}
++
++
++/*!	What libdrm's amdgpu_bo_cpu_map() will do on Haiku: the buffer's fake
++	offset from GEM_MMAP, then linuxkpi's mmap stand-in.
++*/
++static void*
++map_buffer(int fd, uint32_t handle, uint64_t size, const char* what)
++{
++	drm_amdgpu_gem_mmap mmap = {};
++	mmap.in.handle = handle;
++	if (drm_ioctl(fd, DRM_IOCTL_AMDGPU_GEM_MMAP, &mmap) != 0) {
++		check(what, -1);
++		return NULL;
++	}
++
++	linuxkpi_mmap request = {};
++	request.offset = mmap.out.addr_ptr;
++	request.size = size;
++	request.flags = LINUXKPI_MMAP_READ | LINUXKPI_MMAP_WRITE;
++	if (!check(what, drm_ioctl(fd, LINUXKPI_IOCTL_MMAP, &request)))
++		return NULL;
++	area_info info;
++	if (get_area_info(request.area, &info) == B_OK)
++		printf("      area %d at %p, %zu bytes\n", (int)request.area,
++			info.address, info.size);
++	return (void*)(uintptr_t)request.address;
++}
++
++
++static void
++unmap_buffer(int fd, void* address)
++{
++	linuxkpi_munmap request = {};
++	request.address = (uintptr_t)address;
++	check("LINUXKPI_IOCTL_MUNMAP", drm_ioctl(fd, LINUXKPI_IOCTL_MUNMAP,
++		&request));
++}
++
++
++static bool
++map_gpu(int fd, uint32_t handle, uint64_t address, uint64_t size,
++	uint32_t operation)
++{
++	drm_amdgpu_gem_va va = {};
++	va.handle = handle;
++	va.operation = operation;
++	va.flags = AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE
++		| AMDGPU_VM_PAGE_EXECUTABLE;
++	va.va_address = address;
++	va.map_size = size;
++	return check(operation == AMDGPU_VA_OP_MAP ? "AMDGPU_GEM_VA map"
++		: "AMDGPU_GEM_VA unmap", drm_ioctl(fd, DRM_IOCTL_AMDGPU_GEM_VA, &va));
++}
++
++
++static void
++test_mapping(int fd)
++{
++	const uint64_t size = 1 << 20;
++	uint32_t handle = create_buffer(fd, size, AMDGPU_GEM_DOMAIN_VRAM,
++		AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED, "AMDGPU_GEM_CREATE (1 MiB VRAM)");
++	if (handle == 0)
++		return;
++
++	uint32_t* data = (uint32_t*)map_buffer(fd, handle, size,
++		"map VRAM buffer");
++	if (data != NULL) {
++		for (uint32_t i = 0; i < size / 4; i++)
++			data[i] = i * 0x9e3779b9;
++		uint32_t errors = 0;
++		for (uint32_t i = 0; i < size / 4; i++) {
++			if (data[i] != i * 0x9e3779b9)
++				errors++;
++		}
++		check("CPU write/read through the VRAM mapping",
++			errors == 0 ? 0 : (errno = EIO, -1));
++		unmap_buffer(fd, data);
++	}
++
++	if (map_gpu(fd, handle, 1ULL << 32, size, AMDGPU_VA_OP_MAP))
++		map_gpu(fd, handle, 1ULL << 32, size, AMDGPU_VA_OP_UNMAP);
++	close_buffer(fd, handle);
++}
++
++
++/*!	SDMA (v6) copies \a size bytes from VRAM to GTT. The IB is built by the
++	CPU in a third buffer, padded with NOPs to 8 dwords.
++*/
++static void
++test_sdma_copy(int fd)
++{
++	const uint64_t size = 1 << 20;
++	const uint64_t sourceVA = 0x100000000ULL, destinationVA = 0x200000000ULL,
++		ibVA = 0x300000000ULL;
++
++	drm_amdgpu_ctx context = {};
++	context.in.op = AMDGPU_CTX_OP_ALLOC_CTX;
++	if (!check("AMDGPU_CTX alloc", drm_ioctl(fd, DRM_IOCTL_AMDGPU_CTX,
++			&context)))
++		return;
++	uint32_t contextID = context.out.alloc.ctx_id;
++
++	uint32_t source = create_buffer(fd, size, AMDGPU_GEM_DOMAIN_VRAM,
++		AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED, "create source (VRAM)");
++	uint32_t destination = create_buffer(fd, size, AMDGPU_GEM_DOMAIN_GTT, 0,
++		"create destination (GTT)");
++	uint32_t ib = create_buffer(fd, 4096, AMDGPU_GEM_DOMAIN_GTT, 0,
++		"create IB (GTT)");
++	uint32_t* sourceData = source != 0
++		? (uint32_t*)map_buffer(fd, source, size, "map source") : NULL;
++	uint32_t* destinationData = destination != 0
++		? (uint32_t*)map_buffer(fd, destination, size, "map destination")
++		: NULL;
++	uint32_t* ibData = ib != 0
++		? (uint32_t*)map_buffer(fd, ib, 4096, "map IB") : NULL;
++
++	if (sourceData != NULL && destinationData != NULL && ibData != NULL
++		&& map_gpu(fd, source, sourceVA, size, AMDGPU_VA_OP_MAP)
++		&& map_gpu(fd, destination, destinationVA, size, AMDGPU_VA_OP_MAP)
++		&& map_gpu(fd, ib, ibVA, 4096, AMDGPU_VA_OP_MAP)) {
++		for (uint32_t i = 0; i < size / 4; i++) {
++			sourceData[i] = 0xc0ffee00 ^ (i * 2654435761u);
++			destinationData[i] = 0xdeadbeef;
++		}
++
++		uint32_t count = 0;
++		ibData[count++] = 0x00000001;	// SDMA_OP_COPY, COPY_LINEAR
++		ibData[count++] = size - 1;
++		ibData[count++] = 0;
++		ibData[count++] = (uint32_t)sourceVA;
++		ibData[count++] = sourceVA >> 32;
++		ibData[count++] = (uint32_t)destinationVA;
++		ibData[count++] = destinationVA >> 32;
++		while (count % 8 != 0)
++			ibData[count++] = 0;		// SDMA_OP_NOP
++
++		drm_amdgpu_bo_list_entry buffers[3] = {
++			{ source, 0 }, { destination, 0 }, { ib, 0 } };
++		drm_amdgpu_bo_list_in bufferList = {};
++		bufferList.operation = ~0U;
++		bufferList.list_handle = ~0U;
++		bufferList.bo_number = 3;
++		bufferList.bo_info_size = sizeof(drm_amdgpu_bo_list_entry);
++		bufferList.bo_info_ptr = (uintptr_t)buffers;
++
++		drm_amdgpu_cs_chunk_ib ibChunk = {};
++		ibChunk.va_start = ibVA;
++		ibChunk.ib_bytes = count * 4;
++		ibChunk.ip_type = AMDGPU_HW_IP_DMA;
++
++		drm_amdgpu_cs_chunk chunks[2] = {};
++		chunks[0].chunk_id = AMDGPU_CHUNK_ID_BO_HANDLES;
++		chunks[0].length_dw = sizeof(bufferList) / 4;
++		chunks[0].chunk_data = (uintptr_t)&bufferList;
++		chunks[1].chunk_id = AMDGPU_CHUNK_ID_IB;
++		chunks[1].length_dw = sizeof(ibChunk) / 4;
++		chunks[1].chunk_data = (uintptr_t)&ibChunk;
++		uint64_t chunkPointers[2] = { (uintptr_t)&chunks[0],
++			(uintptr_t)&chunks[1] };
++
++		drm_amdgpu_cs submission = {};
++		submission.in.ctx_id = contextID;
++		submission.in.num_chunks = 2;
++		submission.in.chunks = (uintptr_t)chunkPointers;
++		bigtime_t start = system_time();
++		if (check("AMDGPU_CS (SDMA copy, 1 MiB)", drm_ioctl(fd,
++				DRM_IOCTL_AMDGPU_CS, &submission))) {
++			printf("      sequence %llu\n",
++				(unsigned long long)submission.out.handle);
++
++			drm_amdgpu_wait_cs wait = {};
++			wait.in.handle = submission.out.handle;
++			wait.in.timeout = (system_time() + 5000000) * 1000;
++				// absolute, on the same clock as system_time()
++			wait.in.ip_type = AMDGPU_HW_IP_DMA;
++			wait.in.ctx_id = contextID;
++			if (check("AMDGPU_WAIT_CS", drm_ioctl(fd, DRM_IOCTL_AMDGPU_WAIT_CS,
++					&wait))) {
++				printf("      status %llu after %lld us\n",
++					(unsigned long long)wait.out.status,
++					(long long)(system_time() - start));
++				uint32_t errors = 0;
++				for (uint32_t i = 0; i < size / 4; i++) {
++					if (destinationData[i] != (0xc0ffee00 ^ (i * 2654435761u)))
++						errors++;
++				}
++				if (errors != 0)
++					printf("      %u of %u words differ, first %#x\n", errors,
++						(uint32_t)(size / 4), destinationData[0]);
++				check("GPU copy arrived in system memory",
++					errors == 0 && wait.out.status == 0 ? 0 : (errno = EIO, -1));
++			}
++		}
++
++		map_gpu(fd, ib, ibVA, 4096, AMDGPU_VA_OP_UNMAP);
++		map_gpu(fd, destination, destinationVA, size, AMDGPU_VA_OP_UNMAP);
++		map_gpu(fd, source, sourceVA, size, AMDGPU_VA_OP_UNMAP);
++	}
++
++	if (ibData != NULL)
++		unmap_buffer(fd, ibData);
++	if (destinationData != NULL)
++		unmap_buffer(fd, destinationData);
++	if (sourceData != NULL)
++		unmap_buffer(fd, sourceData);
++	if (ib != 0)
++		close_buffer(fd, ib);
++	if (destination != 0)
++		close_buffer(fd, destination);
++	if (source != 0)
++		close_buffer(fd, source);
++
++	memset(&context, 0, sizeof(context));
++	context.in.op = AMDGPU_CTX_OP_FREE_CTX;
++	context.in.ctx_id = contextID;
++	check("AMDGPU_CTX free", drm_ioctl(fd, DRM_IOCTL_AMDGPU_CTX, &context));
++}
++
++
++int
++main(int argc, char** argv)
++{
++	const char* path = argc > 1 ? argv[1] : "/dev/dri/renderD128";
++	int fd = open(path, O_RDWR | O_CLOEXEC);
++	if (fd < 0) {
++		printf("FAIL  open %s: %s\n", path, strerror(errno));
++		return 1;
++	}
++	printf("ok    open %s\n", path);
++
++	test_version(fd);
++	test_info(fd);
++	test_context(fd);
++	test_mapping(fd);
++	test_sdma_copy(fd);
++
++	close(fd);
++	printf("%s: %d failure(s)\n", sFailures == 0 ? "PASS" : "DONE", sFailures);
++	return sFailures == 0 ? 0 : 1;
++}
+diff --git a/src/bin/amdgputest/compat/sys/ioccom.h b/src/bin/amdgputest/compat/sys/ioccom.h
+new file mode 100644
+index 0000000000..d21529dd01
+--- /dev/null
++++ b/src/bin/amdgputest/compat/sys/ioccom.h
+@@ -0,0 +1,31 @@
++/*
++ * Copyright 2026, hans2294.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _AMDGPUTEST_SYS_IOCCOM_H
++#define _AMDGPUTEST_SYS_IOCCOM_H
++
++/* Linux's ioctl encoding, which Linux's DRM in linuxkpi decodes: number,
++ * type, size and direction in one 32 bit command. Linux's uapi drm.h
++ * includes this on systems that are not Linux. */
++#define _IOC_NRBITS		8
++#define _IOC_TYPEBITS	8
++#define _IOC_SIZEBITS	14
++#define _IOC_NRSHIFT	0
++#define _IOC_TYPESHIFT	(_IOC_NRSHIFT + _IOC_NRBITS)
++#define _IOC_SIZESHIFT	(_IOC_TYPESHIFT + _IOC_TYPEBITS)
++#define _IOC_DIRSHIFT	(_IOC_SIZESHIFT + _IOC_SIZEBITS)
++#define _IOC_NONE		0U
++#define _IOC_WRITE		1U
++#define _IOC_READ		2U
++
++#define _IOC(dir, type, nr, size) \
++	(((dir) << _IOC_DIRSHIFT) | ((type) << _IOC_TYPESHIFT) \
++		| ((nr) << _IOC_NRSHIFT) | ((size) << _IOC_SIZESHIFT))
++#define _IO(type, nr)			_IOC(_IOC_NONE, (type), (nr), 0)
++#define _IOR(type, nr, t)		_IOC(_IOC_READ, (type), (nr), sizeof(t))
++#define _IOW(type, nr, t)		_IOC(_IOC_WRITE, (type), (nr), sizeof(t))
++#define _IOWR(type, nr, t)		_IOC(_IOC_READ | _IOC_WRITE, (type), (nr), \
++	sizeof(t))
++
++#endif
+diff --git a/src/bin/gltest/Jamfile b/src/bin/gltest/Jamfile
+new file mode 100644
+index 0000000000..9ff5f5d6c5
+--- /dev/null
++++ b/src/bin/gltest/Jamfile
+@@ -0,0 +1,9 @@
++SubDir HAIKU_TOP src bin gltest ;
++
++# EGL and OpenGL headers from the Mesa tree next to Haiku's; libEGL is
++# dlopen()ed at run time.
++SubDirSysHdrs [ FDirName $(HAIKU_TOP) .. mesa include ] ;
++
++Application gltest :
++	gltest.c
++	;
+diff --git a/src/bin/gltest/gltest.c b/src/bin/gltest/gltest.c
+new file mode 100644
+index 0000000000..53d051fdfd
+--- /dev/null
++++ b/src/bin/gltest/gltest.c
+@@ -0,0 +1,257 @@
++/*
++ * Copyright 2026, hans2294.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*	OpenGL without a window: EGL on the surfaceless platform (the DRM render
++	node, through libdrm), an OpenGL 4.6 core context with no surface, a
++	triangle drawn into a framebuffer object and read back, and a fill rate
++	measurement. With radeonsi underneath, all of it runs on the GPU.
++
++	gltest
++*/
++
++
++#include <dlfcn.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <OS.h>
++
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#include <GL/glcorearb.h>
++
++
++static int sFailures;
++
++
++static int
++check(const char *what, int ok)
++{
++	printf("%s  %s\n", ok ? "ok  " : "FAIL", what);
++	if (!ok)
++		sFailures++;
++	return ok;
++}
++
++
++#define GL_FUNCTIONS(F) \
++	F(PFNGLGETSTRINGPROC, glGetString) \
++	F(PFNGLGETINTEGERVPROC, glGetIntegerv) \
++	F(PFNGLGETERRORPROC, glGetError) \
++	F(PFNGLGENTEXTURESPROC, glGenTextures) \
++	F(PFNGLBINDTEXTUREPROC, glBindTexture) \
++	F(PFNGLTEXSTORAGE2DPROC, glTexStorage2D) \
++	F(PFNGLGENFRAMEBUFFERSPROC, glGenFramebuffers) \
++	F(PFNGLBINDFRAMEBUFFERPROC, glBindFramebuffer) \
++	F(PFNGLFRAMEBUFFERTEXTURE2DPROC, glFramebufferTexture2D) \
++	F(PFNGLCHECKFRAMEBUFFERSTATUSPROC, glCheckFramebufferStatus) \
++	F(PFNGLCREATESHADERPROC, glCreateShader) \
++	F(PFNGLSHADERSOURCEPROC, glShaderSource) \
++	F(PFNGLCOMPILESHADERPROC, glCompileShader) \
++	F(PFNGLGETSHADERIVPROC, glGetShaderiv) \
++	F(PFNGLGETSHADERINFOLOGPROC, glGetShaderInfoLog) \
++	F(PFNGLCREATEPROGRAMPROC, glCreateProgram) \
++	F(PFNGLATTACHSHADERPROC, glAttachShader) \
++	F(PFNGLLINKPROGRAMPROC, glLinkProgram) \
++	F(PFNGLGETPROGRAMIVPROC, glGetProgramiv) \
++	F(PFNGLUSEPROGRAMPROC, glUseProgram) \
++	F(PFNGLGETUNIFORMLOCATIONPROC, glGetUniformLocation) \
++	F(PFNGLUNIFORM1FPROC, glUniform1f) \
++	F(PFNGLGENVERTEXARRAYSPROC, glGenVertexArrays) \
++	F(PFNGLBINDVERTEXARRAYPROC, glBindVertexArray) \
++	F(PFNGLVIEWPORTPROC, glViewport) \
++	F(PFNGLCLEARCOLORPROC, glClearColor) \
++	F(PFNGLCLEARPROC, glClear) \
++	F(PFNGLDRAWARRAYSPROC, glDrawArrays) \
++	F(PFNGLREADPIXELSPROC, glReadPixels) \
++	F(PFNGLFINISHPROC, glFinish)
++
++#define DECLARE(type, name) static type name;
++GL_FUNCTIONS(DECLARE)
++
++
++static const char *kVertexShader =
++	"#version 460 core\n"
++	"uniform float scale;\n"
++	"out vec3 color;\n"
++	"const vec2 corners[3] = vec2[](vec2(0.0, 0.8), vec2(-0.8, -0.8),\n"
++	"	vec2(0.8, -0.8));\n"
++	"const vec3 colors[3] = vec3[](vec3(1, 0, 0), vec3(0, 1, 0),\n"
++	"	vec3(0, 0, 1));\n"
++	"void main() {\n"
++	"	gl_Position = vec4(corners[gl_VertexID] * scale, 0.0, 1.0);\n"
++	"	color = colors[gl_VertexID];\n"
++	"}\n";
++
++static const char *kFragmentShader =
++	"#version 460 core\n"
++	"in vec3 color;\n"
++	"out vec4 fragColor;\n"
++	"void main() { fragColor = vec4(color, 1.0); }\n";
++
++
++static GLuint
++compile(GLenum type, const char *source)
++{
++	GLuint shader = glCreateShader(type);
++	glShaderSource(shader, 1, &source, NULL);
++	glCompileShader(shader);
++	GLint ok = 0;
++	glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++	if (!ok) {
++		char log[1024];
++		glGetShaderInfoLog(shader, sizeof(log), NULL, log);
++		printf("      %s\n", log);
++		return 0;
++	}
++	return shader;
++}
++
++
++int
++main(void)
++{
++	setvbuf(stdout, NULL, _IOLBF, 0);
++
++	void *library = dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL);
++	if (!check("dlopen libEGL.so.1", library != NULL)) {
++		printf("      %s\n", dlerror());
++		return 1;
++	}
++#define EGL_FUNCTION(type, name) type name = (type)dlsym(library, #name);
++	EGL_FUNCTION(PFNEGLGETPROCADDRESSPROC, eglGetProcAddress)
++	EGL_FUNCTION(PFNEGLGETPLATFORMDISPLAYPROC, eglGetPlatformDisplay)
++	EGL_FUNCTION(PFNEGLINITIALIZEPROC, eglInitialize)
++	EGL_FUNCTION(PFNEGLQUERYSTRINGPROC, eglQueryString)
++	EGL_FUNCTION(PFNEGLBINDAPIPROC, eglBindAPI)
++	EGL_FUNCTION(PFNEGLCREATECONTEXTPROC, eglCreateContext)
++	EGL_FUNCTION(PFNEGLMAKECURRENTPROC, eglMakeCurrent)
++	EGL_FUNCTION(PFNEGLDESTROYCONTEXTPROC, eglDestroyContext)
++	EGL_FUNCTION(PFNEGLTERMINATEPROC, eglTerminate)
++	EGL_FUNCTION(PFNEGLGETERRORPROC, eglGetError)
++
++	EGLDisplay display = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA,
++		EGL_DEFAULT_DISPLAY, NULL);
++	EGLint major, minor;
++	if (!check("eglInitialize (surfaceless)", display != EGL_NO_DISPLAY
++			&& eglInitialize(display, &major, &minor))) {
++		printf("      EGL error %#x\n", eglGetError());
++		return 1;
++	}
++	printf("      EGL %d.%d, %s, APIs: %s\n", major, minor,
++		eglQueryString(display, EGL_VENDOR),
++		eglQueryString(display, EGL_CLIENT_APIS));
++
++	eglBindAPI(EGL_OPENGL_API);
++	const EGLint contextAttributes[] = {
++		EGL_CONTEXT_MAJOR_VERSION, 4,
++		EGL_CONTEXT_MINOR_VERSION, 6,
++		EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
++		EGL_NONE
++	};
++	EGLContext context = eglCreateContext(display, EGL_NO_CONFIG_KHR,
++		EGL_NO_CONTEXT, contextAttributes);
++	if (!check("eglCreateContext (OpenGL 4.6 core, no config)",
++			context != EGL_NO_CONTEXT)
++		|| !check("eglMakeCurrent (no surface)", eglMakeCurrent(display,
++			EGL_NO_SURFACE, EGL_NO_SURFACE, context))) {
++		printf("      EGL error %#x\n", eglGetError());
++		return 1;
++	}
++
++#define LOAD(type, name) name = (type)eglGetProcAddress(#name);
++	GL_FUNCTIONS(LOAD)
++	printf("      GL_VENDOR    %s\n", (const char *)glGetString(GL_VENDOR));
++	printf("      GL_RENDERER  %s\n", (const char *)glGetString(GL_RENDERER));
++	printf("      GL_VERSION   %s\n", (const char *)glGetString(GL_VERSION));
++	printf("      GLSL         %s\n",
++		(const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));
++
++	const int size = 512;
++	GLuint texture, framebuffer, vertexArray;
++	glGenTextures(1, &texture);
++	glBindTexture(GL_TEXTURE_2D, texture);
++	glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, size, size);
++	glGenFramebuffers(1, &framebuffer);
++	glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
++	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
++		texture, 0);
++	check("framebuffer object complete",
++		glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
++
++	GLuint vertex = compile(GL_VERTEX_SHADER, kVertexShader);
++	GLuint fragment = compile(GL_FRAGMENT_SHADER, kFragmentShader);
++	GLuint program = glCreateProgram();
++	glAttachShader(program, vertex);
++	glAttachShader(program, fragment);
++	glLinkProgram(program);
++	GLint linked = 0;
++	glGetProgramiv(program, GL_LINK_STATUS, &linked);
++	if (!check("GLSL 4.60 shaders compiled and linked", vertex && fragment
++			&& linked))
++		return 1;
++	glUseProgram(program);
++	glUniform1f(glGetUniformLocation(program, "scale"), 1.0f);
++	glGenVertexArrays(1, &vertexArray);
++	glBindVertexArray(vertexArray);
++
++	glViewport(0, 0, size, size);
++	glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
++	glClear(GL_COLOR_BUFFER_BIT);
++	glDrawArrays(GL_TRIANGLES, 0, 3);
++
++	uint8_t *pixels = malloc(size * size * 4);
++	glReadPixels(0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
++	// below the top corner: red; near the lower corners: green, blue;
++	// a corner of the image: the clear colour
++	const uint8_t *top = pixels + ((size * 85 / 100) * size + size / 2) * 4;
++	const uint8_t *left = pixels + ((size * 12 / 100) * size + size * 14 / 100) * 4;
++	const uint8_t *right = pixels + ((size * 12 / 100) * size + size * 86 / 100) * 4;
++	const uint8_t *corner = pixels + ((size - 4) * size + 4) * 4;
++	printf("      top %02x%02x%02x, left %02x%02x%02x, right %02x%02x%02x, "
++		"corner %02x%02x%02x\n", top[0], top[1], top[2], left[0], left[1],
++		left[2], right[0], right[1], right[2], corner[0], corner[1], corner[2]);
++	check("triangle read back with its colours", top[0] > 200 && top[1] < 60
++		&& left[1] > 200 && left[0] < 60 && right[2] > 200 && right[0] < 60
++		// 0.1 * 255 is 25.5: either rounding is right
++		&& (corner[0] == 0x19 || corner[0] == 0x1a) && corner[0] == corner[1]
++		&& glGetError() == GL_NO_ERROR);
++
++	// Fill rate: big triangles into a 4K framebuffer
++	const int big = 4096;
++	GLuint bigTexture, bigFramebuffer;
++	glGenTextures(1, &bigTexture);
++	glBindTexture(GL_TEXTURE_2D, bigTexture);
++	glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, big, big);
++	glGenFramebuffers(1, &bigFramebuffer);
++	glBindFramebuffer(GL_FRAMEBUFFER, bigFramebuffer);
++	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
++		bigTexture, 0);
++	glViewport(0, 0, big, big);
++	glUniform1f(glGetUniformLocation(program, "scale"), 1.25f);
++	glFinish();
++	const int draws = 2000;
++	bigtime_t start = system_time();
++	for (int i = 0; i < draws; i++)
++		glDrawArrays(GL_TRIANGLES, 0, 3);
++	glFinish();
++	double seconds = (system_time() - start) / 1000000.0;
++	// the triangle covers about 0.64 * 1.25^2 / 2 of the target... roughly
++	double pixelsPerDraw = big * (double)big * 0.5;
++	printf("      %d draws of ~%.0f Mpixels in %.3f s: ~%.0f Gpixels/s\n",
++		draws, pixelsPerDraw / 1e6, seconds,
++		draws * pixelsPerDraw / seconds / 1e9);
++	check("fill rate measured", glGetError() == GL_NO_ERROR);
++
++	free(pixels);
++	eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++	eglDestroyContext(display, context);
++	eglTerminate(display);
++	printf("%s: %d failure(s)\n", sFailures == 0 ? "PASS" : "DONE", sFailures);
++	return sFailures == 0 ? 0 : 1;
++}
+diff --git a/src/bin/kmstest/Jamfile b/src/bin/kmstest/Jamfile
+new file mode 100644
+index 0000000000..f3fe186eae
+--- /dev/null
++++ b/src/bin/kmstest/Jamfile
+@@ -0,0 +1,15 @@
++SubDir HAIKU_TOP src bin kmstest ;
++
++# libdrm's errors are -errno with positive errno, as on Linux
++SubDirCcFlags -DB_USE_POSITIVE_POSIX_ERRORS ;
++
++local libdrmTop = [ FDirName $(HAIKU_TOP) .. libdrm ] ;
++SubDirSysHdrs $(libdrmTop) ;
++SubDirSysHdrs [ FDirName $(libdrmTop) amdgpu ] ;
++SubDirSysHdrs [ FDirName $(libdrmTop) include drm ] ;
++SubDirSysHdrs [ FDirName $(libdrmTop) haiku ] ;
++
++Application kmstest :
++	kmstest.c
++	: [ MultiArchDefaultGristFiles libposix_error_mapper.a ] libdrm.so
++	;
+diff --git a/src/bin/kmstest/kmstest.c b/src/bin/kmstest/kmstest.c
+new file mode 100644
+index 0000000000..9626f6da05
+--- /dev/null
++++ b/src/bin/kmstest/kmstest.c
+@@ -0,0 +1,271 @@
++/*
++ * Copyright 2026, hans2294.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*	A picture on the card's own outputs through Linux's KMS with libdrm:
++	finds a connected connector and its preferred mode, draws into a dumb
++	buffer, sets the mode, and animates for a while. The picture goes when
++	it exits (the framebuffer goes with the file).
++
++	kmstest [seconds]    (default 30)
++*/
++
++
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <OS.h>
++
++#include <xf86drm.h>
++#include <xf86drmMode.h>
++
++
++static int sFailures;
++
++
++static int
++check(const char *what, int result)
++{
++	if (result == 0) {
++		printf("ok    %s\n", what);
++		return 1;
++	}
++	printf("FAIL  %s: %d (%s)\n", what, result,
++		strerror(result < 0 ? -result : errno));
++	sFailures++;
++	return 0;
++}
++
++
++static const char *
++connector_type(uint32_t type)
++{
++	switch (type) {
++		case DRM_MODE_CONNECTOR_HDMIA: return "HDMI-A";
++		case DRM_MODE_CONNECTOR_DisplayPort: return "DP";
++		case DRM_MODE_CONNECTOR_DVID: return "DVI-D";
++		case DRM_MODE_CONNECTOR_VGA: return "VGA";
++		case DRM_MODE_CONNECTOR_eDP: return "eDP";
++		case DRM_MODE_CONNECTOR_USB: return "USB";
++		default: return "other";
++	}
++}
++
++
++//	#pragma mark - drawing
++
++
++/* 5x7 glyphs for the few letters the banner needs */
++static const struct { char c; uint8_t rows[7]; } kFont[] = {
++	{ 'A', { 0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11 } },
++	{ 'D', { 0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e } },
++	{ 'E', { 0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f } },
++	{ 'G', { 0x0e, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0f } },
++	{ 'H', { 0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11 } },
++	{ 'I', { 0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e } },
++	{ 'K', { 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 } },
++	{ 'M', { 0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11 } },
++	{ 'N', { 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11 } },
++	{ 'O', { 0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e } },
++	{ 'P', { 0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10 } },
++	{ 'R', { 0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11 } },
++	{ 'S', { 0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e } },
++	{ 'U', { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e } },
++	{ 'X', { 0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11 } },
++	{ '0', { 0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e } },
++	{ '7', { 0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 } },
++	{ '9', { 0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c } },
++	{ ' ', { 0, 0, 0, 0, 0, 0, 0 } },
++};
++
++
++static void
++fill(uint32_t *pixels, uint32_t pitch, int x, int y, int w, int h,
++	uint32_t color)
++{
++	for (int row = y; row < y + h; row++) {
++		uint32_t *line = pixels + row * (pitch / 4);
++		for (int column = x; column < x + w; column++)
++			line[column] = color;
++	}
++}
++
++
++static void
++text(uint32_t *pixels, uint32_t pitch, int x, int y, int scale,
++	const char *string, uint32_t color)
++{
++	for (; *string != '\0'; string++, x += 6 * scale) {
++		for (size_t g = 0; g < sizeof(kFont) / sizeof(kFont[0]); g++) {
++			if (kFont[g].c != *string)
++				continue;
++			for (int row = 0; row < 7; row++) {
++				for (int bit = 0; bit < 5; bit++) {
++					if (kFont[g].rows[row] & (0x10 >> bit))
++						fill(pixels, pitch, x + bit * scale, y + row * scale,
++							scale, scale, color);
++				}
++			}
++		}
++	}
++}
++
++
++/*	Colour bars, a grey ramp, the banner, and a square that travels along
++	the bottom: frame \a frame of the animation.
++*/
++static void
++draw(uint32_t *pixels, uint32_t pitch, int width, int height, uint32_t frame)
++{
++	static const uint32_t kBars[] = { 0xffffff, 0xffff00, 0x00ffff, 0x00ff00,
++		0xff00ff, 0xff0000, 0x0000ff, 0x000000 };
++	int barHeight = height / 2;
++	for (int i = 0; i < 8; i++)
++		fill(pixels, pitch, i * width / 8, 0, width / 8 + 1, barHeight,
++			kBars[i]);
++
++	for (int x = 0; x < width; x++) {
++		uint32_t level = x * 255 / (width - 1);
++		uint32_t grey = level << 16 | level << 8 | level;
++		for (int y = barHeight; y < barHeight + height / 8; y++)
++			pixels[y * (pitch / 4) + x] = grey;
++	}
++
++	int bannerTop = barHeight + height / 8;
++	fill(pixels, pitch, 0, bannerTop, width, height - bannerTop, 0x202838);
++	// Haiku's tab yellow
++	int scale = height / 90;
++	text(pixels, pitch, width / 16, bannerTop + height / 24, scale,
++		"HAIKU", 0xffcb00);
++	text(pixels, pitch, width / 16, bannerTop + height / 24 + 10 * scale,
++		scale * 2 / 3, "RX 7900 GRE  AMDGPU KMS", 0xe0e0e0);
++
++	int size = height / 12;
++	int span = width - size;
++	int position = (frame * 8) % (2 * span);
++	if (position > span)
++		position = 2 * span - position;
++	fill(pixels, pitch, position, height - size - height / 40, size, size,
++		0xffcb00);
++}
++
++
++//	#pragma mark -
++
++
++int
++main(int argc, char **argv)
++{
++	setvbuf(stdout, NULL, _IOLBF, 0);
++	int seconds = argc > 1 ? atoi(argv[1]) : 30;
++
++	int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
++	if (!check("open /dev/dri/card0", fd >= 0 ? 0 : -errno))
++		return 1;
++
++	drmModeResPtr resources = drmModeGetResources(fd);
++	if (!check("drmModeGetResources", resources != NULL ? 0 : -errno))
++		return 1;
++	printf("      %d connectors, %d encoders, %d CRTCs, %d framebuffers max\n",
++		resources->count_connectors, resources->count_encoders,
++		resources->count_crtcs, resources->max_width);
++
++	drmModeConnectorPtr connector = NULL;
++	for (int i = 0; i < resources->count_connectors; i++) {
++		drmModeConnectorPtr candidate = drmModeGetConnector(fd,
++			resources->connectors[i]);
++		if (candidate == NULL)
++			continue;
++		printf("      connector %u: %s-%u, %s, %d modes\n",
++			candidate->connector_id, connector_type(candidate->connector_type),
++			candidate->connector_type_id,
++			candidate->connection == DRM_MODE_CONNECTED ? "connected"
++				: "disconnected", candidate->count_modes);
++		if (connector == NULL && candidate->connection == DRM_MODE_CONNECTED
++			&& candidate->count_modes > 0)
++			connector = candidate;
++		else
++			drmModeFreeConnector(candidate);
++	}
++	if (!check("connected connector", connector != NULL ? 0 : -ENODEV))
++		return 1;
++
++	drmModeModeInfo *mode = &connector->modes[0];
++	for (int i = 0; i < connector->count_modes; i++) {
++		if (connector->modes[i].type & DRM_MODE_TYPE_PREFERRED) {
++			mode = &connector->modes[i];
++			break;
++		}
++	}
++	printf("      mode %s, %u Hz\n", mode->name, mode->vrefresh);
++
++	// a CRTC the connector's encoders can drive
++	uint32_t crtc = 0;
++	for (int e = 0; e < connector->count_encoders && crtc == 0; e++) {
++		drmModeEncoderPtr encoder = drmModeGetEncoder(fd,
++			connector->encoders[e]);
++		if (encoder == NULL)
++			continue;
++		for (int c = 0; c < resources->count_crtcs; c++) {
++			if (encoder->possible_crtcs & (1u << c)) {
++				crtc = resources->crtcs[c];
++				break;
++			}
++		}
++		drmModeFreeEncoder(encoder);
++	}
++	if (!check("CRTC for the connector", crtc != 0 ? 0 : -ENODEV))
++		return 1;
++
++	struct drm_mode_create_dumb create = {
++		.width = mode->hdisplay,
++		.height = mode->vdisplay,
++		.bpp = 32,
++	};
++	if (!check("DRM_IOCTL_MODE_CREATE_DUMB", drmIoctl(fd,
++			DRM_IOCTL_MODE_CREATE_DUMB, &create)))
++		return 1;
++	struct drm_mode_map_dumb map = { .handle = create.handle };
++	void *pixels;
++	if (!check("DRM_IOCTL_MODE_MAP_DUMB", drmIoctl(fd, DRM_IOCTL_MODE_MAP_DUMB,
++			&map))
++		|| !check("drmMap", drmMap(fd, map.offset, create.size, &pixels)))
++		return 1;
++
++	uint32_t framebuffer;
++	if (!check("drmModeAddFB", drmModeAddFB(fd, mode->hdisplay,
++			mode->vdisplay, 24, 32, create.pitch, create.handle, &framebuffer)))
++		return 1;
++
++	draw(pixels, create.pitch, mode->hdisplay, mode->vdisplay, 0);
++	bigtime_t start = system_time();
++	if (!check("drmModeSetCrtc", drmModeSetCrtc(fd, crtc, framebuffer, 0, 0,
++			&connector->connector_id, 1, mode)))
++		return 1;
++	printf("      mode set in %" PRId64 " ms; showing it for %d s\n",
++		(system_time() - start) / 1000, seconds);
++
++	uint32_t frame = 0;
++	while (system_time() - start < (bigtime_t)seconds * 1000000) {
++		draw(pixels, create.pitch, mode->hdisplay, mode->vdisplay, ++frame);
++		snooze(1000000 / 30);
++	}
++	printf("      %u frames drawn\n", frame);
++
++	drmUnmap(pixels, create.size);
++	drmModeRmFB(fd, framebuffer);
++	struct drm_mode_destroy_dumb destroy = { .handle = create.handle };
++	drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
++	drmModeFreeConnector(connector);
++	drmModeFreeResources(resources);
++	close(fd);
++	printf("%s: %d failure(s)\n", sFailures == 0 ? "PASS" : "DONE", sFailures);
++	return sFailures == 0 ? 0 : 1;
++}
+diff --git a/src/bin/libdrmtest/Jamfile b/src/bin/libdrmtest/Jamfile
+new file mode 100644
+index 0000000000..3bfe1ab35c
+--- /dev/null
++++ b/src/bin/libdrmtest/Jamfile
+@@ -0,0 +1,16 @@
++SubDir HAIKU_TOP src bin libdrmtest ;
++
++# libdrm's errors are -errno with positive errno, as on Linux
++SubDirCcFlags -DB_USE_POSITIVE_POSIX_ERRORS ;
++
++local libdrmTop = [ FDirName $(HAIKU_TOP) .. libdrm ] ;
++SubDirSysHdrs $(libdrmTop) ;
++SubDirSysHdrs [ FDirName $(libdrmTop) amdgpu ] ;
++SubDirSysHdrs [ FDirName $(libdrmTop) include drm ] ;
++SubDirSysHdrs [ FDirName $(libdrmTop) haiku ] ;
++
++Application libdrmtest :
++	libdrmtest.c
++	: [ MultiArchDefaultGristFiles libposix_error_mapper.a ] libdrm.so
++		libdrm_amdgpu.so
++	;
+diff --git a/src/bin/libdrmtest/libdrmtest.c b/src/bin/libdrmtest/libdrmtest.c
+new file mode 100644
+index 0000000000..f97d5f51b4
+--- /dev/null
++++ b/src/bin/libdrmtest/libdrmtest.c
+@@ -0,0 +1,439 @@
++/*
++ * Copyright 2026, hans2294.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*	Uses Linux's amdgpu through libdrm and libdrm_amdgpu the way Mesa does:
++	device enumeration with PCI ids, node names, amdgpu_device_initialize(),
++	GPU and heap info, buffers with CPU mappings and GPU addresses, and an
++	SDMA copy from VRAM to GTT submitted with amdgpu_cs_submit() and waited
++	for with amdgpu_cs_query_fence_status(), and PRIME: a buffer shared
++	through a dma-buf fd with another DRM file, the scanout buffer of the
++	primary node's CRTC exported the way a client would get at it, and
++	mappings that survive a fork().
++
++	libdrmtest
++*/
++
++
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/wait.h>
++
++#include <xf86drm.h>
++#include <xf86drmMode.h>
++#include <amdgpu.h>
++#include <amdgpu_drm.h>
++
++
++static int sFailures;
++
++
++static int
++check(const char *what, int result)
++{
++	if (result == 0) {
++		printf("ok    %s\n", what);
++		return 1;
++	}
++	printf("FAIL  %s: %d (%s)\n", what, result,
++		strerror(result < 0 ? -result : result));
++	sFailures++;
++	return 0;
++}
++
++
++static char *
++test_enumeration(void)
++{
++	drmDevicePtr devices[8];
++	int count = drmGetDevices2(DRM_DEVICE_GET_PCI_REVISION, devices, 8);
++	if (!check("drmGetDevices2", count > 0 ? 0 : (count < 0 ? count : -ENODEV)))
++		return NULL;
++
++	char *renderNode = NULL;
++	for (int i = 0; i < count; i++) {
++		drmDevicePtr device = devices[i];
++		printf("      device %d: bus type %d", i, device->bustype);
++		if (device->bustype == DRM_BUS_PCI) {
++			printf(", PCI %04x:%02x:%02x.%u, %04x:%04x (%04x:%04x) rev %#x",
++				device->businfo.pci->domain, device->businfo.pci->bus,
++				device->businfo.pci->dev, device->businfo.pci->func,
++				device->deviceinfo.pci->vendor_id,
++				device->deviceinfo.pci->device_id,
++				device->deviceinfo.pci->subvendor_id,
++				device->deviceinfo.pci->subdevice_id,
++				device->deviceinfo.pci->revision_id);
++		}
++		printf("\n");
++		for (int node = 0; node < DRM_NODE_MAX; node++) {
++			if (device->available_nodes & (1 << node))
++				printf("        node %d: %s\n", node, device->nodes[node]);
++		}
++		if (renderNode == NULL
++			&& (device->available_nodes & (1 << DRM_NODE_RENDER)))
++			renderNode = strdup(device->nodes[DRM_NODE_RENDER]);
++	}
++	drmFreeDevices(devices, count);
++	return renderNode;
++}
++
++
++static void
++test_node_names(int fd)
++{
++	int type = drmGetNodeTypeFromFd(fd);
++	check("drmGetNodeTypeFromFd", type == DRM_NODE_RENDER ? 0 : -EINVAL);
++
++	char *primary = drmGetPrimaryDeviceNameFromFd(fd);
++	char *render = drmGetRenderDeviceNameFromFd(fd);
++	if (check("drmGetPrimaryDeviceNameFromFd", primary != NULL ? 0 : -ENOENT))
++		printf("      %s\n", primary);
++	if (check("drmGetRenderDeviceNameFromFd", render != NULL ? 0 : -ENOENT))
++		printf("      %s\n", render);
++	free(primary);
++	free(render);
++
++	drmDevicePtr device;
++	if (check("drmGetDevice2", drmGetDevice2(fd, 0, &device))) {
++		if (device->bustype == DRM_BUS_PCI)
++			printf("      %04x:%04x\n", device->deviceinfo.pci->vendor_id,
++				device->deviceinfo.pci->device_id);
++		drmFreeDevice(&device);
++	}
++}
++
++
++static int
++allocate(amdgpu_device_handle device, uint64_t size, uint32_t heap,
++	uint64_t flags, uint64_t *address, amdgpu_bo_handle *bo,
++	amdgpu_va_handle *va, void **cpu, const char *what)
++{
++	struct amdgpu_bo_alloc_request request = {
++		.alloc_size = size,
++		.phys_alignment = 4096,
++		.preferred_heap = heap,
++		.flags = flags,
++	};
++	if (!check(what, amdgpu_bo_alloc(device, &request, bo)))
++		return 0;
++	if (!check("  amdgpu_va_range_alloc", amdgpu_va_range_alloc(device,
++			amdgpu_gpu_va_range_general, size, 4096, 0, address, va, 0)))
++		return 0;
++	if (!check("  amdgpu_bo_va_op map", amdgpu_bo_va_op(*bo, 0, size, *address,
++			0, AMDGPU_VA_OP_MAP)))
++		return 0;
++	return check("  amdgpu_bo_cpu_map", amdgpu_bo_cpu_map(*bo, cpu));
++}
++
++
++static void
++release(uint64_t size, uint64_t address, amdgpu_bo_handle bo,
++	amdgpu_va_handle va)
++{
++	if (bo == NULL)
++		return;
++	amdgpu_bo_cpu_unmap(bo);
++	amdgpu_bo_va_op(bo, 0, size, address, 0, AMDGPU_VA_OP_UNMAP);
++	if (va != NULL)
++		amdgpu_va_range_free(va);
++	amdgpu_bo_free(bo);
++}
++
++
++static void
++test_sdma_copy(amdgpu_device_handle device)
++{
++	const uint64_t size = 4 << 20;
++	amdgpu_bo_handle source = NULL, destination = NULL, ib = NULL;
++	amdgpu_va_handle sourceVA = NULL, destinationVA = NULL, ibVA = NULL;
++	uint64_t sourceAddress = 0, destinationAddress = 0, ibAddress = 0;
++	uint32_t *sourceData = NULL, *destinationData = NULL, *ibData = NULL;
++	amdgpu_context_handle context;
++
++	if (!check("amdgpu_cs_ctx_create", amdgpu_cs_ctx_create(device, &context)))
++		return;
++
++	if (allocate(device, size, AMDGPU_GEM_DOMAIN_VRAM,
++			AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED, &sourceAddress, &source,
++			&sourceVA, (void **)&sourceData, "amdgpu_bo_alloc source (VRAM)")
++		&& allocate(device, size, AMDGPU_GEM_DOMAIN_GTT, 0, &destinationAddress,
++			&destination, &destinationVA, (void **)&destinationData,
++			"amdgpu_bo_alloc destination (GTT)")
++		&& allocate(device, 4096, AMDGPU_GEM_DOMAIN_GTT, 0, &ibAddress, &ib,
++			&ibVA, (void **)&ibData, "amdgpu_bo_alloc IB (GTT)")) {
++		for (uint32_t i = 0; i < size / 4; i++) {
++			sourceData[i] = i ^ 0x5a5a5a5a;
++			destinationData[i] = 0;
++		}
++
++		// SDMA v6 linear copies are at most 4 MiB - 1 byte; two halves
++		uint32_t count = 0;
++		for (uint64_t offset = 0; offset < size; offset += size / 2) {
++			ibData[count++] = 0x00000001;	// SDMA_OP_COPY, COPY_LINEAR
++			ibData[count++] = size / 2 - 1;
++			ibData[count++] = 0;
++			ibData[count++] = (uint32_t)(sourceAddress + offset);
++			ibData[count++] = (sourceAddress + offset) >> 32;
++			ibData[count++] = (uint32_t)(destinationAddress + offset);
++			ibData[count++] = (destinationAddress + offset) >> 32;
++		}
++		while (count % 8 != 0)
++			ibData[count++] = 0;			// SDMA_OP_NOP
++
++		amdgpu_bo_handle buffers[3] = { source, destination, ib };
++		amdgpu_bo_list_handle list;
++		if (check("amdgpu_bo_list_create", amdgpu_bo_list_create(device, 3,
++				buffers, NULL, &list))) {
++			struct amdgpu_cs_ib_info ibInfo = {
++				.ib_mc_address = ibAddress,
++				.size = count,
++			};
++			struct amdgpu_cs_request request = {
++				.ip_type = AMDGPU_HW_IP_DMA,
++				.resources = list,
++				.number_of_ibs = 1,
++				.ibs = &ibInfo,
++			};
++			if (check("amdgpu_cs_submit (SDMA copy, 4 MiB)",
++					amdgpu_cs_submit(context, 0, &request, 1))) {
++				struct amdgpu_cs_fence fence = {
++					.context = context,
++					.ip_type = AMDGPU_HW_IP_DMA,
++					.fence = request.seq_no,
++				};
++				uint32_t expired = 0;
++				if (check("amdgpu_cs_query_fence_status",
++						amdgpu_cs_query_fence_status(&fence,
++							AMDGPU_TIMEOUT_INFINITE, 0, &expired))) {
++					uint32_t errors = 0;
++					for (uint32_t i = 0; i < size / 4; i++) {
++						if (destinationData[i] != (i ^ 0x5a5a5a5a))
++							errors++;
++					}
++					printf("      fence %" PRIu64 " expired %u, %u wrong words\n",
++						request.seq_no, expired, errors);
++					check("GPU copy arrived", expired && errors == 0 ? 0 : -EIO);
++				}
++			}
++			amdgpu_bo_list_destroy(list);
++		}
++	}
++
++	release(4096, ibAddress, ib, ibVA);
++	release(size, destinationAddress, destination, destinationVA);
++	release(size, sourceAddress, source, sourceVA);
++	amdgpu_cs_ctx_free(context);
++}
++
++
++/*	A GTT buffer goes out as a dma-buf fd and comes back in through a second
++	render node file, whose mapping must show what the first one wrote.
++*/
++static void
++test_prime(amdgpu_device_handle device, const char *path)
++{
++	const uint64_t size = 64 * 1024;
++	struct amdgpu_bo_alloc_request request = {
++		.alloc_size = size,
++		.phys_alignment = 4096,
++		.preferred_heap = AMDGPU_GEM_DOMAIN_GTT,
++	};
++	amdgpu_bo_handle bo;
++	uint32_t *cpu;
++	if (!check("PRIME: amdgpu_bo_alloc", amdgpu_bo_alloc(device, &request, &bo)))
++		return;
++	if (check("PRIME: amdgpu_bo_cpu_map", amdgpu_bo_cpu_map(bo,
++			(void **)&cpu))) {
++		for (uint32_t i = 0; i < size / 4; i++)
++			cpu[i] = 0x5a000000 | i;
++	}
++
++	uint32_t dmaBuf;
++	if (check("PRIME: amdgpu_bo_export (dma-buf fd)", amdgpu_bo_export(bo,
++			amdgpu_bo_handle_type_dma_buf_fd, &dmaBuf))) {
++		printf("      dma-buf fd %u\n", dmaBuf);
++
++		struct amdgpu_bo_import_result result;
++		if (check("PRIME: amdgpu_bo_import (same device)", amdgpu_bo_import(
++				device, amdgpu_bo_handle_type_dma_buf_fd, dmaBuf, &result))) {
++			check("PRIME: import gives the same buffer and size",
++				result.buf_handle == bo && result.alloc_size == size
++					? 0 : -EINVAL);
++			amdgpu_bo_free(result.buf_handle);
++		}
++
++		int other = open(path, O_RDWR | O_CLOEXEC);
++		uint32_t handle;
++		if (check("PRIME: drmPrimeFDToHandle (second file)",
++				drmPrimeFDToHandle(other, dmaBuf, &handle))) {
++			union drm_amdgpu_gem_mmap mmap = { .in.handle = handle };
++			void *view;
++			if (check("PRIME: map in the second file", drmIoctl(other,
++					DRM_IOCTL_AMDGPU_GEM_MMAP, &mmap))
++				&& check("PRIME: drmMap", drmMap(other, mmap.out.addr_ptr,
++					size, &view))) {
++				int same = memcmp(view, cpu, size) == 0;
++				check("PRIME: both files see the same pages",
++					same ? 0 : -EIO);
++				drmUnmap(view, size);
++			}
++			drmCloseBufferHandle(other, handle);
++		}
++		close(other);
++		close(dmaBuf);
++	}
++	amdgpu_bo_free(bo);
++}
++
++
++/*	Mappings are shared, as on Linux: a fork() in the process must leave them
++	as they are. A write after the fork has to reach the buffer, which a new
++	mapping of it shows, and not a private copy of the page or a panic.
++*/
++static void
++test_fork(amdgpu_device_handle device, const char *what, uint32_t heap,
++	uint64_t flags)
++{
++	const uint64_t size = 64 * 1024;
++	struct amdgpu_bo_alloc_request request = {
++		.alloc_size = size,
++		.phys_alignment = 4096,
++		.preferred_heap = heap,
++		.flags = flags,
++	};
++	amdgpu_bo_handle bo;
++	uint32_t *cpu;
++	char name[64];
++	snprintf(name, sizeof(name), "fork: amdgpu_bo_alloc %s", what);
++	if (!check(name, amdgpu_bo_alloc(device, &request, &bo)))
++		return;
++	if (check("fork: amdgpu_bo_cpu_map", amdgpu_bo_cpu_map(bo, (void **)&cpu))) {
++		for (uint32_t i = 0; i < size / 4; i++)
++			cpu[i] = 0x11000000 | i;
++
++		pid_t child = fork();
++		if (child == 0)
++			_exit(0);
++		int status = 0;
++		check("fork: fork and wait",
++			child > 0 && waitpid(child, &status, 0) == child ? 0 : -ECHILD);
++
++		for (uint32_t i = 0; i < size / 4; i++)
++			cpu[i] = 0x22000000 | i;
++
++		amdgpu_bo_cpu_unmap(bo);
++		if (check("fork: map again", amdgpu_bo_cpu_map(bo, (void **)&cpu))) {
++			uint32_t errors = 0;
++			for (uint32_t i = 0; i < size / 4; i++) {
++				if (cpu[i] != (0x22000000 | i))
++					errors++;
++			}
++			snprintf(name, sizeof(name), "fork: writes reach the buffer (%s)",
++				what);
++			check(name, errors == 0 ? 0 : -EIO);
++			amdgpu_bo_cpu_unmap(bo);
++		}
++	}
++	amdgpu_bo_free(bo);
++}
++
++
++/*	What a client needs for drawing straight into the screen: the CRTC's
++	frame buffer from the primary node (not being master), as a dma-buf fd
++	that imports on the render node.
++*/
++static void
++test_scanout_export(int renderFD)
++{
++	int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
++	if (!check("scanout: open primary node", fd >= 0 ? 0 : -errno))
++		return;
++	drmModeResPtr resources = drmModeGetResources(fd);
++	uint32_t framebuffer = 0;
++	for (int i = 0; resources != NULL && i < resources->count_crtcs; i++) {
++		drmModeCrtcPtr crtc = drmModeGetCrtc(fd, resources->crtcs[i]);
++		if (crtc != NULL && crtc->buffer_id != 0 && framebuffer == 0)
++			framebuffer = crtc->buffer_id;
++		drmModeFreeCrtc(crtc);
++	}
++	drmModeFreeResources(resources);
++	if (framebuffer == 0) {
++		printf("skip  scanout: no CRTC shows a frame buffer yet\n");
++		close(fd);
++		return;
++	}
++
++	drmModeFBPtr info = drmModeGetFB(fd, framebuffer);
++	if (check("scanout: drmModeGetFB with a handle",
++			info != NULL && info->handle != 0 ? 0 : -EPERM)) {
++		printf("      frame buffer %u: %ux%u, pitch %u\n", framebuffer,
++			info->width, info->height, info->pitch);
++		int dmaBuf;
++		uint32_t handle;
++		if (check("scanout: drmPrimeHandleToFD", drmPrimeHandleToFD(fd,
++				info->handle, DRM_CLOEXEC | DRM_RDWR, &dmaBuf))) {
++			if (check("scanout: drmPrimeFDToHandle on the render node",
++					drmPrimeFDToHandle(renderFD, dmaBuf, &handle)))
++				drmCloseBufferHandle(renderFD, handle);
++			close(dmaBuf);
++		}
++		drmCloseBufferHandle(fd, info->handle);
++	}
++	drmModeFreeFB(info);
++	close(fd);
++}
++
++
++int
++main(void)
++{
++	char *path = test_enumeration();
++	if (path == NULL)
++		return 1;
++
++	int fd = open(path, O_RDWR | O_CLOEXEC);
++	if (!check("open render node", fd >= 0 ? 0 : -errno))
++		return 1;
++	test_node_names(fd);
++
++	uint32_t major, minor;
++	amdgpu_device_handle device;
++	if (check("amdgpu_device_initialize", amdgpu_device_initialize(fd, &major,
++			&minor, &device))) {
++		printf("      DRM %u.%u, %s\n", major, minor,
++			amdgpu_get_marketing_name(device));
++
++		struct amdgpu_gpu_info info;
++		if (check("amdgpu_query_gpu_info", amdgpu_query_gpu_info(device,
++				&info)))
++			printf("      asic %#x rev %#x family %u, %u SEs, %" PRIu64
++				" MHz\n", info.asic_id, info.chip_rev, info.family_id,
++				info.num_shader_engines, info.max_engine_clk / 1000);
++
++		struct amdgpu_heap_info heap;
++		if (check("amdgpu_query_heap_info (VRAM)", amdgpu_query_heap_info(
++				device, AMDGPU_GEM_DOMAIN_VRAM, 0, &heap)))
++			printf("      %" PRIu64 " MiB, %" PRIu64 " MiB used\n",
++				heap.heap_size >> 20, heap.heap_usage >> 20);
++
++		test_sdma_copy(device);
++		test_prime(device, path);
++		test_scanout_export(fd);
++		test_fork(device, "GTT", AMDGPU_GEM_DOMAIN_GTT, 0);
++		test_fork(device, "VRAM", AMDGPU_GEM_DOMAIN_VRAM,
++			AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED);
++		check("amdgpu_device_deinitialize", amdgpu_device_deinitialize(device));
++	}
++
++	close(fd);
++	free(path);
++	printf("%s: %d failure(s)\n", sFailures == 0 ? "PASS" : "DONE", sFailures);
++	return sFailures == 0 ? 0 : 1;
++}
+diff --git a/src/bin/tearingtest/Jamfile b/src/bin/tearingtest/Jamfile
+new file mode 100644
+index 0000000000..392fa4031b
+--- /dev/null
++++ b/src/bin/tearingtest/Jamfile
+@@ -0,0 +1,6 @@
++SubDir HAIKU_TOP src bin tearingtest ;
++
++Application tearingtest :
++	tearingtest.cpp
++	: be [ TargetLibsupc++ ]
++	;
+diff --git a/src/bin/tearingtest/tearingtest.cpp b/src/bin/tearingtest/tearingtest.cpp
+new file mode 100644
+index 0000000000..2778c72a87
+--- /dev/null
++++ b/src/bin/tearingtest/tearingtest.cpp
+@@ -0,0 +1,91 @@
++/*
++ * Copyright 2026, hans2294.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*	Material for spotting tearing: a window at (100, 100) whose 800x600
++	view turns black and white as fast as app_server draws it. On a screen
++	that tears, single frames show both; captured from the card's output,
++	tear-free frames are one or the other all over.
++
++	tearingtest [seconds]    (default 10)
++*/
++
++
++#include <Application.h>
++#include <View.h>
++#include <Window.h>
++
++#include <OS.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++
++class FlashWindow : public BWindow {
++public:
++	FlashWindow()
++		: BWindow(BRect(100, 100, 899, 699), "tearingtest", B_TITLED_WINDOW,
++			B_NOT_RESIZABLE | B_NOT_ZOOMABLE)
++	{
++		fView = new BView(Bounds(), "flash", B_FOLLOW_ALL, 0);
++		fView->SetViewColor(B_TRANSPARENT_COLOR);
++		AddChild(fView);
++	}
++
++	BView* fView;
++};
++
++
++class FlashApp : public BApplication {
++public:
++	FlashApp(bigtime_t duration)
++		: BApplication("application/x-vnd.linuxkpi-tearingtest"),
++		  fDuration(duration) {}
++
++	void ReadyToRun()
++	{
++		fWindow = new FlashWindow();
++		fWindow->Show();
++		thread_id thread = spawn_thread(_Flash, "flash", B_NORMAL_PRIORITY,
++			this);
++		resume_thread(thread);
++	}
++
++private:
++	static int32 _Flash(void* self)
++	{
++		FlashApp* app = (FlashApp*)self;
++		snooze(500000);
++		bigtime_t start = system_time();
++		uint32 fills = 0;
++		while (system_time() - start < app->fDuration) {
++			if (!app->fWindow->Lock())
++				break;
++			BView* view = app->fWindow->fView;
++			view->SetHighColor(fills % 2 == 0 ? 0 : 255, fills % 2 == 0 ? 0
++				: 255, fills % 2 == 0 ? 0 : 255);
++			view->FillRect(view->Bounds());
++			view->Sync();
++			app->fWindow->Unlock();
++			fills++;
++		}
++		printf("%" B_PRIu32 " fills in %.1f s\n", fills,
++			(system_time() - start) / 1000000.0);
++		app->PostMessage(B_QUIT_REQUESTED);
++		return 0;
++	}
++
++	bigtime_t fDuration;
++	FlashWindow* fWindow;
++};
++
++
++int
++main(int argc, char** argv)
++{
++	setvbuf(stdout, NULL, _IOLBF, 0);
++	FlashApp app((argc > 1 ? atof(argv[1]) : 10) * 1000000);
++	app.Run();
++	return 0;
++}
+diff --git a/src/bin/vkheadless/Jamfile b/src/bin/vkheadless/Jamfile
+new file mode 100644
+index 0000000000..6bcdda0e27
+--- /dev/null
++++ b/src/bin/vkheadless/Jamfile
+@@ -0,0 +1,9 @@
++SubDir HAIKU_TOP src bin vkheadless ;
++
++# Vulkan's headers from the Mesa tree next to Haiku's; the driver is
++# dlopen()ed at run time.
++SubDirSysHdrs [ FDirName $(HAIKU_TOP) .. mesa include ] ;
++
++Application vkheadless :
++	vkheadless.c
++	;
+diff --git a/src/bin/vkheadless/fill.comp b/src/bin/vkheadless/fill.comp
+new file mode 100644
+index 0000000000..589fb5c205
+--- /dev/null
++++ b/src/bin/vkheadless/fill.comp
+@@ -0,0 +1,10 @@
++#version 450
++// vkheadless' compute shader: data[i] = i * 3 + 7 + push constant
++layout(local_size_x = 64) in;
++layout(std430, binding = 0) buffer Data { uint data[]; };
++layout(push_constant) uniform Push { uint bias; };
++void main()
++{
++	uint i = gl_GlobalInvocationID.x;
++	data[i] = i * 3u + 7u + bias;
++}
+diff --git a/src/bin/vkheadless/fill_spv.h b/src/bin/vkheadless/fill_spv.h
+new file mode 100644
+index 0000000000..e5ed38aa35
+--- /dev/null
++++ b/src/bin/vkheadless/fill_spv.h
+@@ -0,0 +1,39 @@
++// Generated from fill.comp: glslangValidator -V --target-env vulkan1.1 --vn kFillShader -o fill_spv.h fill.comp
++	// 1116.6.0
++	 #pragma once
++const uint32_t kFillShader[] = {
++	0x07230203,0x00010300,0x0008000b,0x00000028,0x00000000,0x00020011,0x00000001,0x0006000b,
++	0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
++	0x0006000f,0x00000005,0x00000004,0x6e69616d,0x00000000,0x0000000b,0x00060010,0x00000004,
++	0x00000011,0x00000040,0x00000001,0x00000001,0x00030003,0x00000002,0x000001c2,0x00040005,
++	0x00000004,0x6e69616d,0x00000000,0x00030005,0x00000008,0x00000069,0x00080005,0x0000000b,
++	0x475f6c67,0x61626f6c,0x766e496c,0x7461636f,0x496e6f69,0x00000044,0x00040005,0x00000011,
++	0x61746144,0x00000000,0x00050006,0x00000011,0x00000000,0x61746164,0x00000000,0x00030005,
++	0x00000013,0x00000000,0x00040005,0x0000001c,0x68737550,0x00000000,0x00050006,0x0000001c,
++	0x00000000,0x73616962,0x00000000,0x00030005,0x0000001e,0x00000000,0x00040047,0x0000000b,
++	0x0000000b,0x0000001c,0x00040047,0x00000010,0x00000006,0x00000004,0x00030047,0x00000011,
++	0x00000002,0x00050048,0x00000011,0x00000000,0x00000023,0x00000000,0x00040047,0x00000013,
++	0x00000021,0x00000000,0x00040047,0x00000013,0x00000022,0x00000000,0x00030047,0x0000001c,
++	0x00000002,0x00050048,0x0000001c,0x00000000,0x00000023,0x00000000,0x00040047,0x00000027,
++	0x0000000b,0x00000019,0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00040015,
++	0x00000006,0x00000020,0x00000000,0x00040020,0x00000007,0x00000007,0x00000006,0x00040017,
++	0x00000009,0x00000006,0x00000003,0x00040020,0x0000000a,0x00000001,0x00000009,0x0004003b,
++	0x0000000a,0x0000000b,0x00000001,0x0004002b,0x00000006,0x0000000c,0x00000000,0x00040020,
++	0x0000000d,0x00000001,0x00000006,0x0003001d,0x00000010,0x00000006,0x0003001e,0x00000011,
++	0x00000010,0x00040020,0x00000012,0x0000000c,0x00000011,0x0004003b,0x00000012,0x00000013,
++	0x0000000c,0x00040015,0x00000014,0x00000020,0x00000001,0x0004002b,0x00000014,0x00000015,
++	0x00000000,0x0004002b,0x00000006,0x00000018,0x00000003,0x0004002b,0x00000006,0x0000001a,
++	0x00000007,0x0003001e,0x0000001c,0x00000006,0x00040020,0x0000001d,0x00000009,0x0000001c,
++	0x0004003b,0x0000001d,0x0000001e,0x00000009,0x00040020,0x0000001f,0x00000009,0x00000006,
++	0x00040020,0x00000023,0x0000000c,0x00000006,0x0004002b,0x00000006,0x00000025,0x00000040,
++	0x0004002b,0x00000006,0x00000026,0x00000001,0x0006002c,0x00000009,0x00000027,0x00000025,
++	0x00000026,0x00000026,0x00050036,0x00000002,0x00000004,0x00000000,0x00000003,0x000200f8,
++	0x00000005,0x0004003b,0x00000007,0x00000008,0x00000007,0x00050041,0x0000000d,0x0000000e,
++	0x0000000b,0x0000000c,0x0004003d,0x00000006,0x0000000f,0x0000000e,0x0003003e,0x00000008,
++	0x0000000f,0x0004003d,0x00000006,0x00000016,0x00000008,0x0004003d,0x00000006,0x00000017,
++	0x00000008,0x00050084,0x00000006,0x00000019,0x00000017,0x00000018,0x00050080,0x00000006,
++	0x0000001b,0x00000019,0x0000001a,0x00050041,0x0000001f,0x00000020,0x0000001e,0x00000015,
++	0x0004003d,0x00000006,0x00000021,0x00000020,0x00050080,0x00000006,0x00000022,0x0000001b,
++	0x00000021,0x00060041,0x00000023,0x00000024,0x00000013,0x00000015,0x00000016,0x0003003e,
++	0x00000024,0x00000022,0x000100fd,0x00010038
++};
+diff --git a/src/bin/vkheadless/vkheadless.c b/src/bin/vkheadless/vkheadless.c
+new file mode 100644
+index 0000000000..fbd71e04d3
+--- /dev/null
++++ b/src/bin/vkheadless/vkheadless.c
+@@ -0,0 +1,495 @@
++/*
++ * Copyright 2026, hans2294.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*	Vulkan without a window: loads a Vulkan driver (RADV) through the ICD
++	interface, as the Vulkan loader would, or the loader itself, lists the
++	devices, and runs a compute shader that fills a buffer, checked by the
++	CPU.
++
++	vkheadless [library]    (default libvulkan_radeon.so; libvulkan.so.1
++							for the loader)
++*/
++
++
++#include <dlfcn.h>
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <OS.h>
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++
++#include "fill_spv.h"
++
++
++typedef VkResult (VKAPI_PTR *NegotiateFunction)(uint32_t *version);
++
++static PFN_vkGetInstanceProcAddr sGetInstanceProcAddr;
++static VkInstance sInstance;
++static int sFailures;
++
++
++static int
++check(const char *what, VkResult result)
++{
++	if (result == VK_SUCCESS) {
++		printf("ok    %s\n", what);
++		return 1;
++	}
++	printf("FAIL  %s: VkResult %d\n", what, result);
++	sFailures++;
++	return 0;
++}
++
++
++static VKAPI_ATTR VkBool32 VKAPI_CALL
++debug_message(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
++	VkDebugUtilsMessageTypeFlagsEXT types,
++	const VkDebugUtilsMessengerCallbackDataEXT *data, void *user)
++{
++	printf("      driver: %s\n", data->pMessage);
++	return VK_FALSE;
++}
++
++
++#define INSTANCE_FUNCTION(name) \
++	PFN_##name name = (PFN_##name)sGetInstanceProcAddr(sInstance, #name)
++
++
++static uint32_t
++find_memory_type(VkPhysicalDeviceMemoryProperties *memory, uint32_t bits,
++	VkMemoryPropertyFlags wanted)
++{
++	for (uint32_t i = 0; i < memory->memoryTypeCount; i++) {
++		if ((bits & (1u << i))
++			&& (memory->memoryTypes[i].propertyFlags & wanted) == wanted)
++			return i;
++	}
++	return UINT32_MAX;
++}
++
++
++static void
++run_compute(VkPhysicalDevice physicalDevice)
++{
++	INSTANCE_FUNCTION(vkGetPhysicalDeviceQueueFamilyProperties);
++	INSTANCE_FUNCTION(vkGetPhysicalDeviceMemoryProperties);
++	INSTANCE_FUNCTION(vkCreateDevice);
++	INSTANCE_FUNCTION(vkGetDeviceProcAddr);
++
++	uint32_t familyCount = 0;
++	vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &familyCount, NULL);
++	VkQueueFamilyProperties families[16];
++	if (familyCount > 16)
++		familyCount = 16;
++	vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &familyCount,
++		families);
++	uint32_t family = UINT32_MAX;
++	for (uint32_t i = 0; i < familyCount; i++) {
++		printf("      queue family %u: %u queue(s), flags %#x\n", i,
++			families[i].queueCount, families[i].queueFlags);
++		if (family == UINT32_MAX
++			&& (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT))
++			family = i;
++	}
++
++	float priority = 1.0f;
++	VkDeviceQueueCreateInfo queueInfo = {
++		.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++		.queueFamilyIndex = family,
++		.queueCount = 1,
++		.pQueuePriorities = &priority,
++	};
++	VkDeviceCreateInfo deviceInfo = {
++		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++		.queueCreateInfoCount = 1,
++		.pQueueCreateInfos = &queueInfo,
++	};
++	VkDevice device;
++	if (!check("vkCreateDevice", vkCreateDevice(physicalDevice, &deviceInfo,
++			NULL, &device)))
++		return;
++
++#define DEVICE_FUNCTION(name) \
++	PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(device, #name)
++	DEVICE_FUNCTION(vkDestroyDevice);
++	DEVICE_FUNCTION(vkGetDeviceQueue);
++	DEVICE_FUNCTION(vkCreateBuffer);
++	DEVICE_FUNCTION(vkDestroyBuffer);
++	DEVICE_FUNCTION(vkGetBufferMemoryRequirements);
++	DEVICE_FUNCTION(vkAllocateMemory);
++	DEVICE_FUNCTION(vkFreeMemory);
++	DEVICE_FUNCTION(vkBindBufferMemory);
++	DEVICE_FUNCTION(vkMapMemory);
++	DEVICE_FUNCTION(vkUnmapMemory);
++	DEVICE_FUNCTION(vkCreateShaderModule);
++	DEVICE_FUNCTION(vkDestroyShaderModule);
++	DEVICE_FUNCTION(vkCreateDescriptorSetLayout);
++	DEVICE_FUNCTION(vkDestroyDescriptorSetLayout);
++	DEVICE_FUNCTION(vkCreatePipelineLayout);
++	DEVICE_FUNCTION(vkDestroyPipelineLayout);
++	DEVICE_FUNCTION(vkCreateComputePipelines);
++	DEVICE_FUNCTION(vkDestroyPipeline);
++	DEVICE_FUNCTION(vkCreateDescriptorPool);
++	DEVICE_FUNCTION(vkDestroyDescriptorPool);
++	DEVICE_FUNCTION(vkAllocateDescriptorSets);
++	DEVICE_FUNCTION(vkUpdateDescriptorSets);
++	DEVICE_FUNCTION(vkCreateCommandPool);
++	DEVICE_FUNCTION(vkDestroyCommandPool);
++	DEVICE_FUNCTION(vkAllocateCommandBuffers);
++	DEVICE_FUNCTION(vkBeginCommandBuffer);
++	DEVICE_FUNCTION(vkEndCommandBuffer);
++	DEVICE_FUNCTION(vkCmdBindPipeline);
++	DEVICE_FUNCTION(vkCmdBindDescriptorSets);
++	DEVICE_FUNCTION(vkCmdPushConstants);
++	DEVICE_FUNCTION(vkCmdDispatch);
++	DEVICE_FUNCTION(vkCmdPipelineBarrier);
++	DEVICE_FUNCTION(vkCreateFence);
++	DEVICE_FUNCTION(vkDestroyFence);
++	DEVICE_FUNCTION(vkQueueSubmit);
++	DEVICE_FUNCTION(vkWaitForFences);
++
++	VkQueue queue;
++	vkGetDeviceQueue(device, family, 0, &queue);
++
++	const uint32_t count = 1 << 20;
++	const VkDeviceSize size = count * sizeof(uint32_t);
++	VkBufferCreateInfo bufferInfo = {
++		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++		.size = size,
++		.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
++	};
++	VkBuffer buffer;
++	VkDeviceMemory memory = VK_NULL_HANDLE;
++	VkShaderModule module = VK_NULL_HANDLE;
++	VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
++	VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
++	VkPipeline pipeline = VK_NULL_HANDLE;
++	VkDescriptorPool pool = VK_NULL_HANDLE;
++	VkCommandPool commandPool = VK_NULL_HANDLE;
++	VkFence fence = VK_NULL_HANDLE;
++	if (!check("vkCreateBuffer (4 MiB storage)", vkCreateBuffer(device,
++			&bufferInfo, NULL, &buffer)))
++		goto out_device;
++
++	VkMemoryRequirements requirements;
++	vkGetBufferMemoryRequirements(device, buffer, &requirements);
++	VkPhysicalDeviceMemoryProperties memoryProperties;
++	vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memoryProperties);
++	uint32_t type = find_memory_type(&memoryProperties,
++		requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
++			| VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
++			| VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++	if (type == UINT32_MAX)
++		type = find_memory_type(&memoryProperties, requirements.memoryTypeBits,
++			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
++				| VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++	printf("      memory type %u (flags %#x, heap %u)\n", type,
++		memoryProperties.memoryTypes[type].propertyFlags,
++		memoryProperties.memoryTypes[type].heapIndex);
++
++	VkMemoryAllocateInfo allocateInfo = {
++		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++		.allocationSize = requirements.size,
++		.memoryTypeIndex = type,
++	};
++	if (!check("vkAllocateMemory", vkAllocateMemory(device, &allocateInfo,
++			NULL, &memory))
++		|| !check("vkBindBufferMemory", vkBindBufferMemory(device, buffer,
++			memory, 0)))
++		goto out_buffer;
++
++	uint32_t *data;
++	if (!check("vkMapMemory", vkMapMemory(device, memory, 0, size, 0,
++			(void **)&data)))
++		goto out_buffer;
++	memset(data, 0, size);
++
++	VkShaderModuleCreateInfo moduleInfo = {
++		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++		.codeSize = sizeof(kFillShader),
++		.pCode = kFillShader,
++	};
++	VkDescriptorSetLayoutBinding binding = {
++		.binding = 0,
++		.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
++		.descriptorCount = 1,
++		.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
++	};
++	VkDescriptorSetLayoutCreateInfo setLayoutInfo = {
++		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
++		.bindingCount = 1,
++		.pBindings = &binding,
++	};
++	VkPushConstantRange pushRange = {
++		.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
++		.size = sizeof(uint32_t),
++	};
++	if (!check("vkCreateShaderModule", vkCreateShaderModule(device, &moduleInfo,
++			NULL, &module))
++		|| !check("vkCreateDescriptorSetLayout", vkCreateDescriptorSetLayout(
++			device, &setLayoutInfo, NULL, &setLayout)))
++		goto out_objects;
++
++	VkPipelineLayoutCreateInfo pipelineLayoutInfo = {
++		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++		.setLayoutCount = 1,
++		.pSetLayouts = &setLayout,
++		.pushConstantRangeCount = 1,
++		.pPushConstantRanges = &pushRange,
++	};
++	if (!check("vkCreatePipelineLayout", vkCreatePipelineLayout(device,
++			&pipelineLayoutInfo, NULL, &pipelineLayout)))
++		goto out_objects;
++
++	VkComputePipelineCreateInfo pipelineInfo = {
++		.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
++		.stage = {
++			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++			.stage = VK_SHADER_STAGE_COMPUTE_BIT,
++			.module = module,
++			.pName = "main",
++		},
++		.layout = pipelineLayout,
++	};
++	bigtime_t compileStart = system_time();
++	if (!check("vkCreateComputePipelines (ACO)", vkCreateComputePipelines(
++			device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &pipeline)))
++		goto out_objects;
++	printf("      compiled in %" PRId64 " us\n", system_time() - compileStart);
++
++	VkDescriptorPoolSize poolSize = {
++		.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
++		.descriptorCount = 1,
++	};
++	VkDescriptorPoolCreateInfo poolInfo = {
++		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
++		.maxSets = 1,
++		.poolSizeCount = 1,
++		.pPoolSizes = &poolSize,
++	};
++	VkDescriptorSet set;
++	VkDescriptorSetAllocateInfo setInfo = {
++		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
++		.descriptorSetCount = 1,
++		.pSetLayouts = &setLayout,
++	};
++	if (!check("vkCreateDescriptorPool", vkCreateDescriptorPool(device,
++			&poolInfo, NULL, &pool)))
++		goto out_objects;
++	setInfo.descriptorPool = pool;
++	if (!check("vkAllocateDescriptorSets", vkAllocateDescriptorSets(device,
++			&setInfo, &set)))
++		goto out_objects;
++	VkDescriptorBufferInfo descriptorBuffer = { buffer, 0, VK_WHOLE_SIZE };
++	VkWriteDescriptorSet write = {
++		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++		.dstSet = set,
++		.descriptorCount = 1,
++		.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
++		.pBufferInfo = &descriptorBuffer,
++	};
++	vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
++
++	VkCommandPoolCreateInfo commandPoolInfo = {
++		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++		.queueFamilyIndex = family,
++	};
++	VkCommandBuffer commands;
++	VkCommandBufferAllocateInfo commandsInfo = {
++		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++		.commandBufferCount = 1,
++	};
++	if (!check("vkCreateCommandPool", vkCreateCommandPool(device,
++			&commandPoolInfo, NULL, &commandPool)))
++		goto out_objects;
++	commandsInfo.commandPool = commandPool;
++	if (!check("vkAllocateCommandBuffers", vkAllocateCommandBuffers(device,
++			&commandsInfo, &commands)))
++		goto out_objects;
++
++	const uint32_t bias = 1000;
++	VkCommandBufferBeginInfo beginInfo = {
++		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++	};
++	VkMemoryBarrier barrier = {
++		.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++		.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++		.dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++	};
++	vkBeginCommandBuffer(commands, &beginInfo);
++	vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
++	vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE,
++		pipelineLayout, 0, 1, &set, 0, NULL);
++	vkCmdPushConstants(commands, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
++		0, sizeof(bias), &bias);
++	vkCmdDispatch(commands, count / 64, 1, 1);
++	vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++		VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
++	if (!check("record command buffer", vkEndCommandBuffer(commands)))
++		goto out_objects;
++
++	VkFenceCreateInfo fenceInfo = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++	VkSubmitInfo submit = {
++		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++		.commandBufferCount = 1,
++		.pCommandBuffers = &commands,
++	};
++	if (!check("vkCreateFence", vkCreateFence(device, &fenceInfo, NULL, &fence)))
++		goto out_objects;
++	bigtime_t start = system_time();
++	if (check("vkQueueSubmit (1M invocations)", vkQueueSubmit(queue, 1, &submit,
++			fence))
++		&& check("vkWaitForFences", vkWaitForFences(device, 1, &fence, VK_TRUE,
++			5000000000ull))) {
++		printf("      done after %" PRId64 " us\n", system_time() - start);
++		uint32_t errors = 0;
++		for (uint32_t i = 0; i < count; i++) {
++			if (data[i] != i * 3 + 7 + bias)
++				errors++;
++		}
++		printf("      data[0] = %u, data[%u] = %u, %u wrong\n", data[0],
++			count - 1, data[count - 1], errors);
++		check("shader results", errors == 0 ? VK_SUCCESS : VK_ERROR_UNKNOWN);
++	}
++
++out_objects:
++	if (fence != VK_NULL_HANDLE)
++		vkDestroyFence(device, fence, NULL);
++	if (commandPool != VK_NULL_HANDLE)
++		vkDestroyCommandPool(device, commandPool, NULL);
++	if (pool != VK_NULL_HANDLE)
++		vkDestroyDescriptorPool(device, pool, NULL);
++	if (pipeline != VK_NULL_HANDLE)
++		vkDestroyPipeline(device, pipeline, NULL);
++	if (pipelineLayout != VK_NULL_HANDLE)
++		vkDestroyPipelineLayout(device, pipelineLayout, NULL);
++	if (setLayout != VK_NULL_HANDLE)
++		vkDestroyDescriptorSetLayout(device, setLayout, NULL);
++	if (module != VK_NULL_HANDLE)
++		vkDestroyShaderModule(device, module, NULL);
++	vkUnmapMemory(device, memory);
++out_buffer:
++	if (memory != VK_NULL_HANDLE)
++		vkFreeMemory(device, memory, NULL);
++	vkDestroyBuffer(device, buffer, NULL);
++out_device:
++	vkDestroyDevice(device, NULL);
++}
++
++
++int
++main(int argc, char **argv)
++{
++	// line by line, so a crash does not swallow what came before
++	setvbuf(stdout, NULL, _IOLBF, 0);
++
++	const char *driver = argc > 1 ? argv[1] : "libvulkan_radeon.so";
++	void *library = dlopen(driver, RTLD_NOW | RTLD_LOCAL);
++	if (library == NULL) {
++		printf("FAIL  dlopen %s: %s\n", driver, dlerror());
++		return 1;
++	}
++	printf("ok    dlopen %s\n", driver);
++
++	NegotiateFunction negotiate = (NegotiateFunction)dlsym(library,
++		"vk_icdNegotiateLoaderICDInterfaceVersion");
++	sGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(library,
++		"vk_icdGetInstanceProcAddr");
++	if (negotiate != NULL && sGetInstanceProcAddr != NULL) {
++		uint32_t interfaceVersion = 5;
++		if (check("ICD interface negotiation", negotiate(&interfaceVersion)))
++			printf("      version %u\n", interfaceVersion);
++	} else {
++		// the Vulkan loader
++		sGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(library,
++			"vkGetInstanceProcAddr");
++		if (sGetInstanceProcAddr == NULL) {
++			printf("FAIL  neither a Vulkan driver nor the loader\n");
++			return 1;
++		}
++		printf("ok    Vulkan loader\n");
++	}
++
++	PFN_vkCreateInstance vkCreateInstance = (PFN_vkCreateInstance)
++		sGetInstanceProcAddr(NULL, "vkCreateInstance");
++	VkApplicationInfo application = {
++		.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++		.pApplicationName = "vkheadless",
++		.apiVersion = VK_API_VERSION_1_3,
++	};
++	// The driver's warnings and errors come out through debug utils
++	const char *extensions[] = { VK_EXT_DEBUG_UTILS_EXTENSION_NAME };
++	VkDebugUtilsMessengerCreateInfoEXT messengerInfo = {
++		.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
++		.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT
++			| VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
++		.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT
++			| VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT
++			| VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
++		.pfnUserCallback = debug_message,
++	};
++	VkInstanceCreateInfo instanceInfo = {
++		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++		.pNext = &messengerInfo,
++		.pApplicationInfo = &application,
++		.enabledExtensionCount = 1,
++		.ppEnabledExtensionNames = extensions,
++	};
++	if (!check("vkCreateInstance", vkCreateInstance(&instanceInfo, NULL,
++			&sInstance)))
++		return 1;
++
++	INSTANCE_FUNCTION(vkCreateDebugUtilsMessengerEXT);
++	VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
++	if (vkCreateDebugUtilsMessengerEXT != NULL)
++		vkCreateDebugUtilsMessengerEXT(sInstance, &messengerInfo, NULL,
++			&messenger);
++
++	INSTANCE_FUNCTION(vkEnumeratePhysicalDevices);
++	INSTANCE_FUNCTION(vkGetPhysicalDeviceProperties);
++	INSTANCE_FUNCTION(vkGetPhysicalDeviceMemoryProperties);
++	INSTANCE_FUNCTION(vkDestroyInstance);
++
++	uint32_t count = 0;
++	VkPhysicalDevice devices[4];
++	vkEnumeratePhysicalDevices(sInstance, &count, NULL);
++	if (count > 4)
++		count = 4;
++	if (check("vkEnumeratePhysicalDevices", count > 0
++			? vkEnumeratePhysicalDevices(sInstance, &count, devices)
++			: VK_ERROR_INITIALIZATION_FAILED)) {
++		for (uint32_t i = 0; i < count; i++) {
++			VkPhysicalDeviceProperties properties;
++			vkGetPhysicalDeviceProperties(devices[i], &properties);
++			printf("      %u: %s, Vulkan %u.%u.%u, driver %#x, %04x:%04x\n", i,
++				properties.deviceName, VK_API_VERSION_MAJOR(properties.apiVersion),
++				VK_API_VERSION_MINOR(properties.apiVersion),
++				VK_API_VERSION_PATCH(properties.apiVersion),
++				properties.driverVersion, properties.vendorID,
++				properties.deviceID);
++			VkPhysicalDeviceMemoryProperties memory;
++			vkGetPhysicalDeviceMemoryProperties(devices[i], &memory);
++			for (uint32_t heap = 0; heap < memory.memoryHeapCount; heap++)
++				printf("      heap %u: %" PRIu64 " MiB, flags %#x\n", heap,
++					(uint64_t)(memory.memoryHeaps[heap].size >> 20),
++					memory.memoryHeaps[heap].flags);
++		}
++		run_compute(devices[0]);
++	}
++
++	INSTANCE_FUNCTION(vkDestroyDebugUtilsMessengerEXT);
++	if (messenger != VK_NULL_HANDLE)
++		vkDestroyDebugUtilsMessengerEXT(sInstance, messenger, NULL);
++	vkDestroyInstance(sInstance, NULL);
++	printf("%s: %d failure(s)\n", sFailures == 0 ? "PASS" : "DONE", sFailures);
++	return sFailures == 0 ? 0 : 1;
++}
+diff --git a/src/bin/vkwindow/Jamfile b/src/bin/vkwindow/Jamfile
+new file mode 100644
+index 0000000000..7ca8ce2c66
+--- /dev/null
++++ b/src/bin/vkwindow/Jamfile
+@@ -0,0 +1,10 @@
++SubDir HAIKU_TOP src bin vkwindow ;
++
++# Vulkan's headers with vulkan_haiku.h from the Vulkan-Headers tree next to
++# Haiku's; the loader is dlopen()ed at run time.
++SubDirSysHdrs [ FDirName $(HAIKU_TOP) .. vulkan-headers include ] ;
++
++Application vkwindow :
++	vkwindow.cpp
++	: be game [ TargetLibsupc++ ]
++	;
+diff --git a/src/bin/vkwindow/triangle.frag b/src/bin/vkwindow/triangle.frag
+new file mode 100644
+index 0000000000..bac8bcec18
+--- /dev/null
++++ b/src/bin/vkwindow/triangle.frag
+@@ -0,0 +1,7 @@
++#version 450
++layout(location = 0) in vec3 color;
++layout(location = 0) out vec4 fragColor;
++void main()
++{
++	fragColor = vec4(color, 1.0);
++}
+diff --git a/src/bin/vkwindow/triangle.vert b/src/bin/vkwindow/triangle.vert
+new file mode 100644
+index 0000000000..fe34becb6b
+--- /dev/null
++++ b/src/bin/vkwindow/triangle.vert
+@@ -0,0 +1,15 @@
++#version 450
++// vkwindow's triangle: corners from the vertex index, turned by the push
++// constant angle, each corner its own colour
++layout(push_constant) uniform Push { float angle; float aspect; };
++layout(location = 0) out vec3 color;
++const vec2 corners[3] = vec2[](vec2(0.0, -0.8), vec2(0.7, 0.45), vec2(-0.7, 0.45));
++const vec3 colors[3] = vec3[](vec3(1.0, 0.2, 0.2), vec3(0.2, 1.0, 0.3), vec3(0.3, 0.4, 1.0));
++void main()
++{
++	vec2 p = corners[gl_VertexIndex];
++	float c = cos(angle), s = sin(angle);
++	p = vec2(c * p.x - s * p.y, s * p.x + c * p.y);
++	gl_Position = vec4(p.x / aspect, p.y, 0.0, 1.0);
++	color = colors[gl_VertexIndex];
++}
+diff --git a/src/bin/vkwindow/triangle_frag.h b/src/bin/vkwindow/triangle_frag.h
+new file mode 100644
+index 0000000000..24bbc7c375
+--- /dev/null
++++ b/src/bin/vkwindow/triangle_frag.h
+@@ -0,0 +1,21 @@
++// Generated from triangle.frag: glslangValidator -V --target-env vulkan1.1 --vn kTriangle_frag -o triangle_frag.h triangle.frag
++	// 1116.6.0
++	 #pragma once
++const uint32_t kTriangle_frag[] = {
++	0x07230203,0x00010300,0x0008000b,0x00000013,0x00000000,0x00020011,0x00000001,0x0006000b,
++	0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
++	0x0007000f,0x00000004,0x00000004,0x6e69616d,0x00000000,0x00000009,0x0000000c,0x00030010,
++	0x00000004,0x00000007,0x00030003,0x00000002,0x000001c2,0x00040005,0x00000004,0x6e69616d,
++	0x00000000,0x00050005,0x00000009,0x67617266,0x6f6c6f43,0x00000072,0x00040005,0x0000000c,
++	0x6f6c6f63,0x00000072,0x00040047,0x00000009,0x0000001e,0x00000000,0x00040047,0x0000000c,
++	0x0000001e,0x00000000,0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00030016,
++	0x00000006,0x00000020,0x00040017,0x00000007,0x00000006,0x00000004,0x00040020,0x00000008,
++	0x00000003,0x00000007,0x0004003b,0x00000008,0x00000009,0x00000003,0x00040017,0x0000000a,
++	0x00000006,0x00000003,0x00040020,0x0000000b,0x00000001,0x0000000a,0x0004003b,0x0000000b,
++	0x0000000c,0x00000001,0x0004002b,0x00000006,0x0000000e,0x3f800000,0x00050036,0x00000002,
++	0x00000004,0x00000000,0x00000003,0x000200f8,0x00000005,0x0004003d,0x0000000a,0x0000000d,
++	0x0000000c,0x00050051,0x00000006,0x0000000f,0x0000000d,0x00000000,0x00050051,0x00000006,
++	0x00000010,0x0000000d,0x00000001,0x00050051,0x00000006,0x00000011,0x0000000d,0x00000002,
++	0x00070050,0x00000007,0x00000012,0x0000000f,0x00000010,0x00000011,0x0000000e,0x0003003e,
++	0x00000009,0x00000012,0x000100fd,0x00010038
++};
+diff --git a/src/bin/vkwindow/triangle_vert.h b/src/bin/vkwindow/triangle_vert.h
+new file mode 100644
+index 0000000000..00f2f5abd1
+--- /dev/null
++++ b/src/bin/vkwindow/triangle_vert.h
+@@ -0,0 +1,81 @@
++// Generated from triangle.vert: glslangValidator -V --target-env vulkan1.1 --vn kTriangle_vert -o triangle_vert.h triangle.vert
++	// 1116.6.0
++	 #pragma once
++const uint32_t kTriangle_vert[] = {
++	0x07230203,0x00010300,0x0008000b,0x00000063,0x00000000,0x00020011,0x00000001,0x0006000b,
++	0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
++	0x0008000f,0x00000000,0x00000004,0x6e69616d,0x00000000,0x00000018,0x00000045,0x00000054,
++	0x00030003,0x00000002,0x000001c2,0x00040005,0x00000004,0x6e69616d,0x00000000,0x00030005,
++	0x00000009,0x00000070,0x00060005,0x00000018,0x565f6c67,0x65747265,0x646e4978,0x00007865,
++	0x00050005,0x0000001b,0x65646e69,0x6c626178,0x00000065,0x00030005,0x0000001f,0x00000063,
++	0x00040005,0x00000020,0x68737550,0x00000000,0x00050006,0x00000020,0x00000000,0x6c676e61,
++	0x00000065,0x00050006,0x00000020,0x00000001,0x65707361,0x00007463,0x00030005,0x00000022,
++	0x00000000,0x00030005,0x00000028,0x00000073,0x00060005,0x00000043,0x505f6c67,0x65567265,
++	0x78657472,0x00000000,0x00060006,0x00000043,0x00000000,0x505f6c67,0x7469736f,0x006e6f69,
++	0x00070006,0x00000043,0x00000001,0x505f6c67,0x746e696f,0x657a6953,0x00000000,0x00070006,
++	0x00000043,0x00000002,0x435f6c67,0x4470696c,0x61747369,0x0065636e,0x00070006,0x00000043,
++	0x00000003,0x435f6c67,0x446c6c75,0x61747369,0x0065636e,0x00030005,0x00000045,0x00000000,
++	0x00040005,0x00000054,0x6f6c6f63,0x00000072,0x00050005,0x0000005f,0x65646e69,0x6c626178,
++	0x00000065,0x00040047,0x00000018,0x0000000b,0x0000002a,0x00030047,0x00000020,0x00000002,
++	0x00050048,0x00000020,0x00000000,0x00000023,0x00000000,0x00050048,0x00000020,0x00000001,
++	0x00000023,0x00000004,0x00030047,0x00000043,0x00000002,0x00050048,0x00000043,0x00000000,
++	0x0000000b,0x00000000,0x00050048,0x00000043,0x00000001,0x0000000b,0x00000001,0x00050048,
++	0x00000043,0x00000002,0x0000000b,0x00000003,0x00050048,0x00000043,0x00000003,0x0000000b,
++	0x00000004,0x00040047,0x00000054,0x0000001e,0x00000000,0x00020013,0x00000002,0x00030021,
++	0x00000003,0x00000002,0x00030016,0x00000006,0x00000020,0x00040017,0x00000007,0x00000006,
++	0x00000002,0x00040020,0x00000008,0x00000007,0x00000007,0x00040015,0x0000000a,0x00000020,
++	0x00000000,0x0004002b,0x0000000a,0x0000000b,0x00000003,0x0004001c,0x0000000c,0x00000007,
++	0x0000000b,0x0004002b,0x00000006,0x0000000d,0x00000000,0x0004002b,0x00000006,0x0000000e,
++	0xbf4ccccd,0x0005002c,0x00000007,0x0000000f,0x0000000d,0x0000000e,0x0004002b,0x00000006,
++	0x00000010,0x3f333333,0x0004002b,0x00000006,0x00000011,0x3ee66666,0x0005002c,0x00000007,
++	0x00000012,0x00000010,0x00000011,0x0004002b,0x00000006,0x00000013,0xbf333333,0x0005002c,
++	0x00000007,0x00000014,0x00000013,0x00000011,0x0006002c,0x0000000c,0x00000015,0x0000000f,
++	0x00000012,0x00000014,0x00040015,0x00000016,0x00000020,0x00000001,0x00040020,0x00000017,
++	0x00000001,0x00000016,0x0004003b,0x00000017,0x00000018,0x00000001,0x00040020,0x0000001a,
++	0x00000007,0x0000000c,0x00040020,0x0000001e,0x00000007,0x00000006,0x0004001e,0x00000020,
++	0x00000006,0x00000006,0x00040020,0x00000021,0x00000009,0x00000020,0x0004003b,0x00000021,
++	0x00000022,0x00000009,0x0004002b,0x00000016,0x00000023,0x00000000,0x00040020,0x00000024,
++	0x00000009,0x00000006,0x0004002b,0x0000000a,0x0000002d,0x00000000,0x0004002b,0x0000000a,
++	0x00000032,0x00000001,0x00040017,0x00000041,0x00000006,0x00000004,0x0004001c,0x00000042,
++	0x00000006,0x00000032,0x0006001e,0x00000043,0x00000041,0x00000006,0x00000042,0x00000042,
++	0x00040020,0x00000044,0x00000003,0x00000043,0x0004003b,0x00000044,0x00000045,0x00000003,
++	0x0004002b,0x00000016,0x00000048,0x00000001,0x0004002b,0x00000006,0x0000004e,0x3f800000,
++	0x00040020,0x00000050,0x00000003,0x00000041,0x00040017,0x00000052,0x00000006,0x00000003,
++	0x00040020,0x00000053,0x00000003,0x00000052,0x0004003b,0x00000053,0x00000054,0x00000003,
++	0x0004001c,0x00000055,0x00000052,0x0000000b,0x0004002b,0x00000006,0x00000056,0x3e4ccccd,
++	0x0006002c,0x00000052,0x00000057,0x0000004e,0x00000056,0x00000056,0x0004002b,0x00000006,
++	0x00000058,0x3e99999a,0x0006002c,0x00000052,0x00000059,0x00000056,0x0000004e,0x00000058,
++	0x0004002b,0x00000006,0x0000005a,0x3ecccccd,0x0006002c,0x00000052,0x0000005b,0x00000058,
++	0x0000005a,0x0000004e,0x0006002c,0x00000055,0x0000005c,0x00000057,0x00000059,0x0000005b,
++	0x00040020,0x0000005e,0x00000007,0x00000055,0x00040020,0x00000060,0x00000007,0x00000052,
++	0x00050036,0x00000002,0x00000004,0x00000000,0x00000003,0x000200f8,0x00000005,0x0004003b,
++	0x00000008,0x00000009,0x00000007,0x0004003b,0x0000001a,0x0000001b,0x00000007,0x0004003b,
++	0x0000001e,0x0000001f,0x00000007,0x0004003b,0x0000001e,0x00000028,0x00000007,0x0004003b,
++	0x0000005e,0x0000005f,0x00000007,0x0004003d,0x00000016,0x00000019,0x00000018,0x0003003e,
++	0x0000001b,0x00000015,0x00050041,0x00000008,0x0000001c,0x0000001b,0x00000019,0x0004003d,
++	0x00000007,0x0000001d,0x0000001c,0x0003003e,0x00000009,0x0000001d,0x00050041,0x00000024,
++	0x00000025,0x00000022,0x00000023,0x0004003d,0x00000006,0x00000026,0x00000025,0x0006000c,
++	0x00000006,0x00000027,0x00000001,0x0000000e,0x00000026,0x0003003e,0x0000001f,0x00000027,
++	0x00050041,0x00000024,0x00000029,0x00000022,0x00000023,0x0004003d,0x00000006,0x0000002a,
++	0x00000029,0x0006000c,0x00000006,0x0000002b,0x00000001,0x0000000d,0x0000002a,0x0003003e,
++	0x00000028,0x0000002b,0x0004003d,0x00000006,0x0000002c,0x0000001f,0x00050041,0x0000001e,
++	0x0000002e,0x00000009,0x0000002d,0x0004003d,0x00000006,0x0000002f,0x0000002e,0x00050085,
++	0x00000006,0x00000030,0x0000002c,0x0000002f,0x0004003d,0x00000006,0x00000031,0x00000028,
++	0x00050041,0x0000001e,0x00000033,0x00000009,0x00000032,0x0004003d,0x00000006,0x00000034,
++	0x00000033,0x00050085,0x00000006,0x00000035,0x00000031,0x00000034,0x00050083,0x00000006,
++	0x00000036,0x00000030,0x00000035,0x0004003d,0x00000006,0x00000037,0x00000028,0x00050041,
++	0x0000001e,0x00000038,0x00000009,0x0000002d,0x0004003d,0x00000006,0x00000039,0x00000038,
++	0x00050085,0x00000006,0x0000003a,0x00000037,0x00000039,0x0004003d,0x00000006,0x0000003b,
++	0x0000001f,0x00050041,0x0000001e,0x0000003c,0x00000009,0x00000032,0x0004003d,0x00000006,
++	0x0000003d,0x0000003c,0x00050085,0x00000006,0x0000003e,0x0000003b,0x0000003d,0x00050081,
++	0x00000006,0x0000003f,0x0000003a,0x0000003e,0x00050050,0x00000007,0x00000040,0x00000036,
++	0x0000003f,0x0003003e,0x00000009,0x00000040,0x00050041,0x0000001e,0x00000046,0x00000009,
++	0x0000002d,0x0004003d,0x00000006,0x00000047,0x00000046,0x00050041,0x00000024,0x00000049,
++	0x00000022,0x00000048,0x0004003d,0x00000006,0x0000004a,0x00000049,0x00050088,0x00000006,
++	0x0000004b,0x00000047,0x0000004a,0x00050041,0x0000001e,0x0000004c,0x00000009,0x00000032,
++	0x0004003d,0x00000006,0x0000004d,0x0000004c,0x00070050,0x00000041,0x0000004f,0x0000004b,
++	0x0000004d,0x0000000d,0x0000004e,0x00050041,0x00000050,0x00000051,0x00000045,0x00000023,
++	0x0003003e,0x00000051,0x0000004f,0x0004003d,0x00000016,0x0000005d,0x00000018,0x0003003e,
++	0x0000005f,0x0000005c,0x00050041,0x00000060,0x00000061,0x0000005f,0x0000005d,0x0004003d,
++	0x00000052,0x00000062,0x00000061,0x0003003e,0x00000054,0x00000062,0x000100fd,0x00010038
++};
+diff --git a/src/bin/vkwindow/vkwindow.cpp b/src/bin/vkwindow/vkwindow.cpp
+new file mode 100644
+index 0000000000..0a83d00f33
+--- /dev/null
++++ b/src/bin/vkwindow/vkwindow.cpp
+@@ -0,0 +1,829 @@
++/*
++ * Copyright 2026, hans2294.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*!	Vulkan in a Haiku window: through the Vulkan loader, a headless surface
++	carrying the window's view (vulkan_haiku.h), a swapchain and a graphics
++	pipeline, a turning triangle on a slowly changing background.
++
++	The window is a BDirectWindow that forwards DirectConnected() to
++	vkDirectConnectedHAIKU, so presents go straight to the frame buffer;
++	"plain" makes it an ordinary BWindow, whose presents go through the view.
++	"immediate" presents without waiting for the vertical blank.
++
++	vkwindow [seconds] [immediate] [plain]
++		(runs until the window is closed without seconds, or with 0)
++*/
++
++
++#include <Application.h>
++#include <Autolock.h>
++#include <DirectWindow.h>
++#include <View.h>
++#include <Window.h>
++
++#include <OS.h>
++#include <dlfcn.h>
++#include <inttypes.h>
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++#include <vulkan/vulkan_haiku.h>
++
++#include "triangle_frag.h"
++#include "triangle_vert.h"
++
++
++#define INSTANCE_FUNCTIONS(F) \
++	F(vkDestroyInstance) \
++	F(vkEnumeratePhysicalDevices) \
++	F(vkGetPhysicalDeviceProperties) \
++	F(vkGetPhysicalDeviceQueueFamilyProperties) \
++	F(vkGetPhysicalDeviceSurfaceSupportKHR) \
++	F(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) \
++	F(vkGetPhysicalDeviceSurfaceFormatsKHR) \
++	F(vkCreateHeadlessSurfaceEXT) \
++	F(vkDestroySurfaceKHR) \
++	F(vkCreateDevice) \
++	F(vkGetDeviceProcAddr)
++
++#define DEVICE_FUNCTIONS(F) \
++	F(vkDestroyDevice) \
++	F(vkGetDeviceQueue) \
++	F(vkDeviceWaitIdle) \
++	F(vkCreateSwapchainKHR) \
++	F(vkDestroySwapchainKHR) \
++	F(vkGetSwapchainImagesKHR) \
++	F(vkAcquireNextImageKHR) \
++	F(vkQueuePresentKHR) \
++	F(vkQueueSubmit) \
++	F(vkCreateImageView) \
++	F(vkDestroyImageView) \
++	F(vkCreateRenderPass) \
++	F(vkDestroyRenderPass) \
++	F(vkCreateFramebuffer) \
++	F(vkDestroyFramebuffer) \
++	F(vkCreateShaderModule) \
++	F(vkDestroyShaderModule) \
++	F(vkCreatePipelineLayout) \
++	F(vkDestroyPipelineLayout) \
++	F(vkCreateGraphicsPipelines) \
++	F(vkDestroyPipeline) \
++	F(vkCreateCommandPool) \
++	F(vkDestroyCommandPool) \
++	F(vkAllocateCommandBuffers) \
++	F(vkResetCommandBuffer) \
++	F(vkBeginCommandBuffer) \
++	F(vkEndCommandBuffer) \
++	F(vkCmdBeginRenderPass) \
++	F(vkCmdEndRenderPass) \
++	F(vkCmdBindPipeline) \
++	F(vkCmdPushConstants) \
++	F(vkCmdSetViewport) \
++	F(vkCmdSetScissor) \
++	F(vkCmdDraw) \
++	F(vkCreateSemaphore) \
++	F(vkDestroySemaphore) \
++	F(vkCreateFence) \
++	F(vkDestroyFence) \
++	F(vkWaitForFences) \
++	F(vkResetFences)
++
++#define DECLARE(name) static PFN_##name name;
++INSTANCE_FUNCTIONS(DECLARE)
++DEVICE_FUNCTIONS(DECLARE)
++
++static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
++
++static const uint32_t kMaxImages = 8;
++
++
++static bool
++check(const char* what, VkResult result)
++{
++	if (result == VK_SUCCESS)
++		return true;
++	printf("FAIL  %s: VkResult %d\n", what, result);
++	return false;
++}
++
++
++/*!	Hands what BDirectWindow::DirectConnected() says on to Vulkan once the
++	device and surface exist, the last word first; until then it keeps it.
++*/
++class DirectForwarder {
++public:
++	DirectForwarder() : fLock("direct forwarder") {}
++	~DirectForwarder() { free(fLast); }
++
++	void Connected(direct_buffer_info* info)
++	{
++		BAutolock _(fLock);
++		size_t size = sizeof(direct_buffer_info)
++			+ (info->clip_list_count > 0 ? info->clip_list_count - 1 : 0)
++				* sizeof(clipping_rect);
++		direct_buffer_info* copy = (direct_buffer_info*)realloc(fLast, size);
++		if (copy != NULL) {
++			memcpy(copy, info, size);
++			fLast = copy;
++		}
++		if (fForward != NULL)
++			fForward(fDevice, fView, info);
++	}
++
++	void Attach(PFN_vkDirectConnectedHAIKU forward, VkDevice device,
++		BView* view)
++	{
++		BAutolock _(fLock);
++		fForward = forward;
++		fDevice = device;
++		fView = view;
++		if (fForward != NULL && fLast != NULL)
++			fForward(fDevice, fView, fLast);
++	}
++
++	void Detach()
++	{
++		BAutolock _(fLock);
++		fForward = NULL;
++	}
++
++private:
++	BLocker fLock;
++	direct_buffer_info* fLast = NULL;
++	PFN_vkDirectConnectedHAIKU fForward = NULL;
++	VkDevice fDevice = VK_NULL_HANDLE;
++	BView* fView = NULL;
++};
++
++
++/*!	All the Vulkan, on a thread of its own: Haiku's window thread must stay
++	free to draw what presenting hands it.
++*/
++class Renderer {
++public:
++	Renderer(BView* view, bigtime_t duration, VkPresentModeKHR presentMode,
++		DirectForwarder* forwarder)
++		: fView(view), fDuration(duration), fPresentMode(presentMode),
++		  fForwarder(forwarder), fQuit(false), fResult(1) {}
++
++	thread_id Start()
++	{
++		fThread = spawn_thread(_Run, "vulkan renderer", B_DISPLAY_PRIORITY,
++			this);
++		resume_thread(fThread);
++		return fThread;
++	}
++
++	void Stop()
++	{
++		fQuit = true;
++		status_t result;
++		wait_for_thread(fThread, &result);
++	}
++
++	int Result() const { return fResult; }
++
++private:
++	static int32 _Run(void* self)
++	{
++		Renderer* renderer = (Renderer*)self;
++		renderer->fResult = renderer->Run();
++		if (renderer->fDuration > 0)
++			be_app->PostMessage(B_QUIT_REQUESTED);
++		return 0;
++	}
++
++	int Run();
++	bool CreateInstance();
++	bool CreateDevice();
++	bool CreatePipeline();
++	void Destroy();
++
++	BView* fView;
++	bigtime_t fDuration;
++	VkPresentModeKHR fPresentMode;
++	DirectForwarder* fForwarder;
++	volatile bool fQuit;
++	int fResult;
++	thread_id fThread;
++
++	VkInstance fInstance = VK_NULL_HANDLE;
++	VkSurfaceKHR fSurface = VK_NULL_HANDLE;
++	VkPhysicalDevice fPhysicalDevice = VK_NULL_HANDLE;
++	VkDevice fDevice = VK_NULL_HANDLE;
++	VkQueue fQueue = VK_NULL_HANDLE;
++	uint32_t fFamily = 0;
++	VkSwapchainKHR fSwapchain = VK_NULL_HANDLE;
++	VkFormat fFormat = VK_FORMAT_UNDEFINED;
++	VkExtent2D fExtent = {};
++	uint32_t fImageCount = 0;
++	VkImage fImages[kMaxImages] = {};
++	VkImageView fViews[kMaxImages] = {};
++	VkFramebuffer fFramebuffers[kMaxImages] = {};
++	VkRenderPass fRenderPass = VK_NULL_HANDLE;
++	VkPipelineLayout fLayout = VK_NULL_HANDLE;
++	VkPipeline fPipeline = VK_NULL_HANDLE;
++	VkCommandPool fCommandPool = VK_NULL_HANDLE;
++	VkCommandBuffer fCommands = VK_NULL_HANDLE;
++	VkSemaphore fAcquired = VK_NULL_HANDLE;
++	VkSemaphore fRendered[kMaxImages] = {};
++	VkFence fFrameDone = VK_NULL_HANDLE;
++};
++
++
++bool
++Renderer::CreateInstance()
++{
++	void* loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
++	if (loader == NULL) {
++		printf("FAIL  dlopen libvulkan.so.1: %s\n", dlerror());
++		return false;
++	}
++	vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(loader,
++		"vkGetInstanceProcAddr");
++	PFN_vkCreateInstance vkCreateInstance = (PFN_vkCreateInstance)
++		vkGetInstanceProcAddr(NULL, "vkCreateInstance");
++
++	const char* extensions[] = {
++		VK_KHR_SURFACE_EXTENSION_NAME,
++		VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME,
++	};
++	VkApplicationInfo application = {};
++	application.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
++	application.pApplicationName = "vkwindow";
++	application.apiVersion = VK_API_VERSION_1_3;
++	VkInstanceCreateInfo instanceInfo = {};
++	instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
++	instanceInfo.pApplicationInfo = &application;
++	instanceInfo.enabledExtensionCount = 2;
++	instanceInfo.ppEnabledExtensionNames = extensions;
++	if (!check("vkCreateInstance", vkCreateInstance(&instanceInfo, NULL,
++			&fInstance)))
++		return false;
++
++#define LOAD_INSTANCE(name) \
++	name = (PFN_##name)vkGetInstanceProcAddr(fInstance, #name);
++	INSTANCE_FUNCTIONS(LOAD_INSTANCE)
++
++	// The view rides along with a headless surface
++	VkHaikuViewSurfaceCreateInfoHAIKU haikuInfo = {};
++	haikuInfo.sType = VK_STRUCTURE_TYPE_HAIKU_VIEW_SURFACE_CREATE_INFO_HAIKU;
++	haikuInfo.view = fView;
++	VkHeadlessSurfaceCreateInfoEXT surfaceInfo = {};
++	surfaceInfo.sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT;
++	surfaceInfo.pNext = &haikuInfo;
++	return check("vkCreateHeadlessSurfaceEXT (Haiku view)",
++		vkCreateHeadlessSurfaceEXT(fInstance, &surfaceInfo, NULL, &fSurface));
++}
++
++
++bool
++Renderer::CreateDevice()
++{
++	uint32_t count = 1;
++	VkResult result = vkEnumeratePhysicalDevices(fInstance, &count,
++		&fPhysicalDevice);
++	if (count == 0 || (result != VK_SUCCESS && result != VK_INCOMPLETE)) {
++		printf("FAIL  no Vulkan device\n");
++		return false;
++	}
++	VkPhysicalDeviceProperties properties;
++	vkGetPhysicalDeviceProperties(fPhysicalDevice, &properties);
++	printf("ok    device: %s\n", properties.deviceName);
++
++	uint32_t familyCount = 8;
++	VkQueueFamilyProperties families[8];
++	vkGetPhysicalDeviceQueueFamilyProperties(fPhysicalDevice, &familyCount,
++		families);
++	fFamily = UINT32_MAX;
++	for (uint32_t i = 0; i < familyCount && fFamily == UINT32_MAX; i++) {
++		VkBool32 present = VK_FALSE;
++		vkGetPhysicalDeviceSurfaceSupportKHR(fPhysicalDevice, i, fSurface,
++			&present);
++		if ((families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present)
++			fFamily = i;
++	}
++	if (fFamily == UINT32_MAX) {
++		printf("FAIL  no graphics queue that can present\n");
++		return false;
++	}
++
++	float priority = 1.0f;
++	VkDeviceQueueCreateInfo queueInfo = {};
++	queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
++	queueInfo.queueFamilyIndex = fFamily;
++	queueInfo.queueCount = 1;
++	queueInfo.pQueuePriorities = &priority;
++	const char* extensions[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
++	VkDeviceCreateInfo deviceInfo = {};
++	deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
++	deviceInfo.queueCreateInfoCount = 1;
++	deviceInfo.pQueueCreateInfos = &queueInfo;
++	deviceInfo.enabledExtensionCount = 1;
++	deviceInfo.ppEnabledExtensionNames = extensions;
++	if (!check("vkCreateDevice", vkCreateDevice(fPhysicalDevice, &deviceInfo,
++			NULL, &fDevice)))
++		return false;
++
++#define LOAD_DEVICE(name) name = (PFN_##name)vkGetDeviceProcAddr(fDevice, #name);
++	DEVICE_FUNCTIONS(LOAD_DEVICE)
++	vkGetDeviceQueue(fDevice, fFamily, 0, &fQueue);
++
++	VkSurfaceCapabilitiesKHR caps;
++	if (!check("vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
++			vkGetPhysicalDeviceSurfaceCapabilitiesKHR(fPhysicalDevice, fSurface,
++				&caps)))
++		return false;
++	fExtent = caps.currentExtent;
++	uint32_t formatCount = 4;
++	VkSurfaceFormatKHR formats[4];
++	vkGetPhysicalDeviceSurfaceFormatsKHR(fPhysicalDevice, fSurface,
++		&formatCount, formats);
++	fFormat = formats[0].format;
++	printf("ok    surface: %ux%u, format %d, at least %u images\n",
++		fExtent.width, fExtent.height, fFormat, caps.minImageCount);
++
++	VkSwapchainCreateInfoKHR swapchainInfo = {};
++	swapchainInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
++	swapchainInfo.surface = fSurface;
++	swapchainInfo.minImageCount = caps.minImageCount;
++	swapchainInfo.imageFormat = fFormat;
++	swapchainInfo.imageColorSpace = formats[0].colorSpace;
++	swapchainInfo.imageExtent = fExtent;
++	swapchainInfo.imageArrayLayers = 1;
++	swapchainInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++	swapchainInfo.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++	swapchainInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
++	swapchainInfo.presentMode = fPresentMode;
++	swapchainInfo.clipped = VK_TRUE;
++	if (!check("vkCreateSwapchainKHR", vkCreateSwapchainKHR(fDevice,
++			&swapchainInfo, NULL, &fSwapchain)))
++		return false;
++	fImageCount = kMaxImages;
++	vkGetSwapchainImagesKHR(fDevice, fSwapchain, &fImageCount, fImages);
++	printf("ok    swapchain with %u images, %s\n", fImageCount,
++		fPresentMode == VK_PRESENT_MODE_FIFO_KHR ? "FIFO" : "IMMEDIATE");
++
++	if (fForwarder != NULL) {
++		PFN_vkDirectConnectedHAIKU directConnected
++			= (PFN_vkDirectConnectedHAIKU)vkGetDeviceProcAddr(fDevice,
++				"vkDirectConnectedHAIKU");
++		if (!check("vkGetDeviceProcAddr(vkDirectConnectedHAIKU)",
++				directConnected != NULL ? VK_SUCCESS
++					: VK_ERROR_EXTENSION_NOT_PRESENT))
++			return false;
++		fForwarder->Attach(directConnected, fDevice, fView);
++	}
++	return true;
++}
++
++
++bool
++Renderer::CreatePipeline()
++{
++	VkAttachmentDescription attachment = {};
++	attachment.format = fFormat;
++	attachment.samples = VK_SAMPLE_COUNT_1_BIT;
++	attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++	attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++	attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
++	attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++	attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++	attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++	VkAttachmentReference colorReference = {
++		0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
++	VkSubpassDescription subpass = {};
++	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++	subpass.colorAttachmentCount = 1;
++	subpass.pColorAttachments = &colorReference;
++	VkSubpassDependency dependency = {};
++	dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
++	dependency.dstSubpass = 0;
++	dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++	dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++	dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++	VkRenderPassCreateInfo renderPassInfo = {};
++	renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
++	renderPassInfo.attachmentCount = 1;
++	renderPassInfo.pAttachments = &attachment;
++	renderPassInfo.subpassCount = 1;
++	renderPassInfo.pSubpasses = &subpass;
++	renderPassInfo.dependencyCount = 1;
++	renderPassInfo.pDependencies = &dependency;
++	if (!check("vkCreateRenderPass", vkCreateRenderPass(fDevice,
++			&renderPassInfo, NULL, &fRenderPass)))
++		return false;
++
++	for (uint32_t i = 0; i < fImageCount; i++) {
++		VkImageViewCreateInfo viewInfo = {};
++		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++		viewInfo.image = fImages[i];
++		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
++		viewInfo.format = fFormat;
++		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++		viewInfo.subresourceRange.levelCount = 1;
++		viewInfo.subresourceRange.layerCount = 1;
++		if (!check("vkCreateImageView", vkCreateImageView(fDevice, &viewInfo,
++				NULL, &fViews[i])))
++			return false;
++		VkFramebufferCreateInfo framebufferInfo = {};
++		framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
++		framebufferInfo.renderPass = fRenderPass;
++		framebufferInfo.attachmentCount = 1;
++		framebufferInfo.pAttachments = &fViews[i];
++		framebufferInfo.width = fExtent.width;
++		framebufferInfo.height = fExtent.height;
++		framebufferInfo.layers = 1;
++		if (!check("vkCreateFramebuffer", vkCreateFramebuffer(fDevice,
++				&framebufferInfo, NULL, &fFramebuffers[i])))
++			return false;
++	}
++
++	VkShaderModule vertex, fragment;
++	VkShaderModuleCreateInfo moduleInfo = {};
++	moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++	moduleInfo.codeSize = sizeof(kTriangle_vert);
++	moduleInfo.pCode = kTriangle_vert;
++	vkCreateShaderModule(fDevice, &moduleInfo, NULL, &vertex);
++	moduleInfo.codeSize = sizeof(kTriangle_frag);
++	moduleInfo.pCode = kTriangle_frag;
++	vkCreateShaderModule(fDevice, &moduleInfo, NULL, &fragment);
++
++	VkPushConstantRange push = { VK_SHADER_STAGE_VERTEX_BIT, 0,
++		2 * sizeof(float) };
++	VkPipelineLayoutCreateInfo layoutInfo = {};
++	layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
++	layoutInfo.pushConstantRangeCount = 1;
++	layoutInfo.pPushConstantRanges = &push;
++	vkCreatePipelineLayout(fDevice, &layoutInfo, NULL, &fLayout);
++
++	VkPipelineShaderStageCreateInfo stages[2] = {};
++	stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++	stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
++	stages[0].module = vertex;
++	stages[0].pName = "main";
++	stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++	stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++	stages[1].module = fragment;
++	stages[1].pName = "main";
++	VkPipelineVertexInputStateCreateInfo vertexInput = {};
++	vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
++	VkPipelineInputAssemblyStateCreateInfo assembly = {};
++	assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
++	assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++	VkPipelineViewportStateCreateInfo viewport = {};
++	viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
++	viewport.viewportCount = 1;
++	viewport.scissorCount = 1;
++	VkPipelineRasterizationStateCreateInfo raster = {};
++	raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
++	raster.polygonMode = VK_POLYGON_MODE_FILL;
++	raster.cullMode = VK_CULL_MODE_NONE;
++	raster.lineWidth = 1.0f;
++	VkPipelineMultisampleStateCreateInfo multisample = {};
++	multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
++	multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++	VkPipelineColorBlendAttachmentState blendAttachment = {};
++	blendAttachment.colorWriteMask = 0xf;
++	VkPipelineColorBlendStateCreateInfo blend = {};
++	blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
++	blend.attachmentCount = 1;
++	blend.pAttachments = &blendAttachment;
++	VkDynamicState dynamicStates[] = { VK_DYNAMIC_STATE_VIEWPORT,
++		VK_DYNAMIC_STATE_SCISSOR };
++	VkPipelineDynamicStateCreateInfo dynamic = {};
++	dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
++	dynamic.dynamicStateCount = 2;
++	dynamic.pDynamicStates = dynamicStates;
++	VkGraphicsPipelineCreateInfo pipelineInfo = {};
++	pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
++	pipelineInfo.stageCount = 2;
++	pipelineInfo.pStages = stages;
++	pipelineInfo.pVertexInputState = &vertexInput;
++	pipelineInfo.pInputAssemblyState = &assembly;
++	pipelineInfo.pViewportState = &viewport;
++	pipelineInfo.pRasterizationState = &raster;
++	pipelineInfo.pMultisampleState = &multisample;
++	pipelineInfo.pColorBlendState = &blend;
++	pipelineInfo.pDynamicState = &dynamic;
++	pipelineInfo.layout = fLayout;
++	pipelineInfo.renderPass = fRenderPass;
++	bool ok = check("vkCreateGraphicsPipelines", vkCreateGraphicsPipelines(
++		fDevice, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &fPipeline));
++	vkDestroyShaderModule(fDevice, vertex, NULL);
++	vkDestroyShaderModule(fDevice, fragment, NULL);
++	if (!ok)
++		return false;
++
++	VkCommandPoolCreateInfo poolInfo = {};
++	poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++	poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++	poolInfo.queueFamilyIndex = fFamily;
++	vkCreateCommandPool(fDevice, &poolInfo, NULL, &fCommandPool);
++	VkCommandBufferAllocateInfo commandsInfo = {};
++	commandsInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++	commandsInfo.commandPool = fCommandPool;
++	commandsInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++	commandsInfo.commandBufferCount = 1;
++	vkAllocateCommandBuffers(fDevice, &commandsInfo, &fCommands);
++
++	VkSemaphoreCreateInfo semaphoreInfo = {};
++	semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
++	vkCreateSemaphore(fDevice, &semaphoreInfo, NULL, &fAcquired);
++	for (uint32_t i = 0; i < fImageCount; i++)
++		vkCreateSemaphore(fDevice, &semaphoreInfo, NULL, &fRendered[i]);
++	VkFenceCreateInfo fenceInfo = {};
++	fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++	fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
++	vkCreateFence(fDevice, &fenceInfo, NULL, &fFrameDone);
++	printf("ok    render pass, pipeline, command buffer\n");
++	return true;
++}
++
++
++int
++Renderer::Run()
++{
++	if (!CreateInstance() || !CreateDevice() || !CreatePipeline()) {
++		Destroy();
++		return 1;
++	}
++
++	bigtime_t start = system_time();
++	bigtime_t lastReport = start;
++	uint32_t frames = 0, framesSinceReport = 0;
++	int result = 0;
++	while (!fQuit && (fDuration <= 0 || system_time() - start < fDuration)) {
++		vkWaitForFences(fDevice, 1, &fFrameDone, VK_TRUE, UINT64_MAX);
++		vkResetFences(fDevice, 1, &fFrameDone);
++
++		uint32_t index;
++		VkResult acquired = vkAcquireNextImageKHR(fDevice, fSwapchain,
++			UINT64_MAX, fAcquired, VK_NULL_HANDLE, &index);
++		if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
++			check("vkAcquireNextImageKHR", acquired);
++			result = 1;
++			break;
++		}
++
++		float seconds = (system_time() - start) / 1000000.0f;
++		VkClearValue clear;
++		clear.color.float32[0] = 0.10f + 0.08f * sinf(seconds * 0.7f);
++		clear.color.float32[1] = 0.12f;
++		clear.color.float32[2] = 0.20f + 0.10f * sinf(seconds * 0.5f + 1.0f);
++		clear.color.float32[3] = 1.0f;
++		float push[2] = { seconds * 1.2f,
++			(float)fExtent.width / (float)fExtent.height };
++
++		vkResetCommandBuffer(fCommands, 0);
++		VkCommandBufferBeginInfo beginInfo = {};
++		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++		vkBeginCommandBuffer(fCommands, &beginInfo);
++		VkRenderPassBeginInfo passInfo = {};
++		passInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
++		passInfo.renderPass = fRenderPass;
++		passInfo.framebuffer = fFramebuffers[index];
++		passInfo.renderArea.extent = fExtent;
++		passInfo.clearValueCount = 1;
++		passInfo.pClearValues = &clear;
++		vkCmdBeginRenderPass(fCommands, &passInfo, VK_SUBPASS_CONTENTS_INLINE);
++		vkCmdBindPipeline(fCommands, VK_PIPELINE_BIND_POINT_GRAPHICS, fPipeline);
++		VkViewport viewport = { 0, 0, (float)fExtent.width,
++			(float)fExtent.height, 0, 1 };
++		VkRect2D scissor = { { 0, 0 }, fExtent };
++		vkCmdSetViewport(fCommands, 0, 1, &viewport);
++		vkCmdSetScissor(fCommands, 0, 1, &scissor);
++		vkCmdPushConstants(fCommands, fLayout, VK_SHADER_STAGE_VERTEX_BIT, 0,
++			sizeof(push), push);
++		vkCmdDraw(fCommands, 3, 1, 0, 0);
++		vkCmdEndRenderPass(fCommands);
++		vkEndCommandBuffer(fCommands);
++
++		VkPipelineStageFlags waitStage
++			= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++		VkSubmitInfo submit = {};
++		submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++		submit.waitSemaphoreCount = 1;
++		submit.pWaitSemaphores = &fAcquired;
++		submit.pWaitDstStageMask = &waitStage;
++		submit.commandBufferCount = 1;
++		submit.pCommandBuffers = &fCommands;
++		submit.signalSemaphoreCount = 1;
++		submit.pSignalSemaphores = &fRendered[index];
++		if (!check("vkQueueSubmit", vkQueueSubmit(fQueue, 1, &submit,
++				fFrameDone))) {
++			result = 1;
++			break;
++		}
++
++		VkPresentInfoKHR presentInfo = {};
++		presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
++		presentInfo.waitSemaphoreCount = 1;
++		presentInfo.pWaitSemaphores = &fRendered[index];
++		presentInfo.swapchainCount = 1;
++		presentInfo.pSwapchains = &fSwapchain;
++		presentInfo.pImageIndices = &index;
++		VkResult presented = vkQueuePresentKHR(fQueue, &presentInfo);
++		if (presented != VK_SUCCESS && presented != VK_SUBOPTIMAL_KHR) {
++			// a closed window ends it
++			if (presented != VK_ERROR_SURFACE_LOST_KHR || !fQuit) {
++				check("vkQueuePresentKHR", presented);
++				result = presented == VK_ERROR_SURFACE_LOST_KHR ? 0 : 1;
++			}
++			break;
++		}
++
++		frames++;
++		framesSinceReport++;
++		bigtime_t now = system_time();
++		if (now - lastReport >= 2000000) {
++			printf("      %.1f frames/s\n",
++				framesSinceReport * 1000000.0 / (now - lastReport));
++			lastReport = now;
++			framesSinceReport = 0;
++		}
++	}
++
++	double elapsed = (system_time() - start) / 1000000.0;
++	printf("%s    %" PRIu32 " frames in %.1f s (%.1f frames/s)\n",
++		result == 0 ? "ok" : "FAIL", frames, elapsed, frames / elapsed);
++	Destroy();
++	return result;
++}
++
++
++void
++Renderer::Destroy()
++{
++	if (fForwarder != NULL)
++		fForwarder->Detach();
++	if (fDevice != VK_NULL_HANDLE) {
++		vkDeviceWaitIdle(fDevice);
++		if (fFrameDone != VK_NULL_HANDLE)
++			vkDestroyFence(fDevice, fFrameDone, NULL);
++		for (uint32_t i = 0; i < kMaxImages; i++) {
++			if (fRendered[i] != VK_NULL_HANDLE)
++				vkDestroySemaphore(fDevice, fRendered[i], NULL);
++			if (fFramebuffers[i] != VK_NULL_HANDLE)
++				vkDestroyFramebuffer(fDevice, fFramebuffers[i], NULL);
++			if (fViews[i] != VK_NULL_HANDLE)
++				vkDestroyImageView(fDevice, fViews[i], NULL);
++		}
++		if (fAcquired != VK_NULL_HANDLE)
++			vkDestroySemaphore(fDevice, fAcquired, NULL);
++		if (fCommandPool != VK_NULL_HANDLE)
++			vkDestroyCommandPool(fDevice, fCommandPool, NULL);
++		if (fPipeline != VK_NULL_HANDLE)
++			vkDestroyPipeline(fDevice, fPipeline, NULL);
++		if (fLayout != VK_NULL_HANDLE)
++			vkDestroyPipelineLayout(fDevice, fLayout, NULL);
++		if (fRenderPass != VK_NULL_HANDLE)
++			vkDestroyRenderPass(fDevice, fRenderPass, NULL);
++		if (fSwapchain != VK_NULL_HANDLE)
++			vkDestroySwapchainKHR(fDevice, fSwapchain, NULL);
++		vkDestroyDevice(fDevice, NULL);
++		fDevice = VK_NULL_HANDLE;
++	}
++	if (fInstance != VK_NULL_HANDLE) {
++		if (fSurface != VK_NULL_HANDLE)
++			vkDestroySurfaceKHR(fInstance, fSurface, NULL);
++		vkDestroyInstance(fInstance, NULL);
++		fInstance = VK_NULL_HANDLE;
++	}
++}
++
++
++/* The renderer draws into the window's view until it is stopped; only then
++ * may the window go. */
++static bool sRendererStopped;
++
++
++static const BRect kWindowFrame(80, 80, 80 + 639, 80 + 479);
++static const char* kWindowTitle = "Vulkan on Haiku (RADV)";
++
++
++static BView*
++create_view(BWindow* window)
++{
++	BView* view = new BView(window->Bounds(), "vulkan", B_FOLLOW_ALL,
++		B_WILL_DRAW);
++	// Vulkan draws everything; app_server should not paint over it
++	view->SetViewColor(B_TRANSPARENT_COLOR);
++	window->AddChild(view);
++	return view;
++}
++
++
++static bool
++quit_requested()
++{
++	if (sRendererStopped)
++		return true;
++	be_app->PostMessage(B_QUIT_REQUESTED);
++	return false;
++}
++
++
++class VulkanWindow : public BWindow {
++public:
++	VulkanWindow(Renderer** renderer, bigtime_t duration,
++		VkPresentModeKHR presentMode)
++		: BWindow(kWindowFrame, kWindowTitle, B_TITLED_WINDOW,
++			B_NOT_RESIZABLE | B_NOT_ZOOMABLE)
++	{
++		*renderer = new Renderer(create_view(this), duration, presentMode,
++			NULL);
++	}
++
++	bool QuitRequested() { return quit_requested(); }
++};
++
++
++class VulkanDirectWindow : public BDirectWindow {
++public:
++	VulkanDirectWindow(Renderer** renderer, bigtime_t duration,
++		VkPresentModeKHR presentMode)
++		: BDirectWindow(kWindowFrame, kWindowTitle, B_TITLED_WINDOW,
++			B_NOT_RESIZABLE | B_NOT_ZOOMABLE)
++	{
++		*renderer = new Renderer(create_view(this), duration, presentMode,
++			&fForwarder);
++	}
++
++	void DirectConnected(direct_buffer_info* info)
++	{
++		fForwarder.Connected(info);
++		BDirectWindow::DirectConnected(info);
++	}
++
++	bool QuitRequested() { return quit_requested(); }
++
++private:
++	DirectForwarder fForwarder;
++};
++
++
++class VulkanApplication : public BApplication {
++public:
++	VulkanApplication(bigtime_t duration, VkPresentModeKHR presentMode,
++		bool direct)
++		: BApplication("application/x-vnd.linuxkpi-vkwindow"),
++		  fDuration(duration), fPresentMode(presentMode), fDirect(direct),
++		  fRenderer(NULL) {}
++
++	void ReadyToRun()
++	{
++		BWindow* window;
++		if (fDirect)
++			window = new VulkanDirectWindow(&fRenderer, fDuration, fPresentMode);
++		else
++			window = new VulkanWindow(&fRenderer, fDuration, fPresentMode);
++		window->Show();
++		fRenderer->Start();
++	}
++
++	bool QuitRequested()
++	{
++		if (fRenderer != NULL)
++			fRenderer->Stop();
++		sRendererStopped = true;
++		return BApplication::QuitRequested();
++	}
++
++	int Result() const { return fRenderer != NULL ? fRenderer->Result() : 1; }
++
++private:
++	bigtime_t fDuration;
++	VkPresentModeKHR fPresentMode;
++	bool fDirect;
++	Renderer* fRenderer;
++};
++
++
++int
++main(int argc, char** argv)
++{
++	setvbuf(stdout, NULL, _IOLBF, 0);
++	bigtime_t duration = argc > 1 ? (bigtime_t)(atof(argv[1]) * 1000000) : 0;
++	VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
++	bool direct = true;
++	for (int i = 2; i < argc; i++) {
++		if (strcmp(argv[i], "immediate") == 0)
++			presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
++		else if (strcmp(argv[i], "plain") == 0)
++			direct = false;
++	}
++	VulkanApplication application(duration, presentMode, direct);
++	application.Run();
++	int result = application.Result();
++	printf("%s\n", result == 0 ? "PASS" : "DONE (failed)");
++	return result;
++}
+diff --git a/src/bin/vsynctest/Jamfile b/src/bin/vsynctest/Jamfile
+new file mode 100644
+index 0000000000..f4bbe3e5d1
+--- /dev/null
++++ b/src/bin/vsynctest/Jamfile
+@@ -0,0 +1,11 @@
++SubDir HAIKU_TOP src bin vsynctest ;
++
++UseBuildFeatureHeaders mesa ;
++
++Includes [ FGristFiles vsynctest.cpp ]
++	: [ BuildFeatureAttribute mesa : headers ] ;
++
++Application vsynctest :
++	vsynctest.cpp
++	: be game [ TargetLibsupc++ ] [ BuildFeatureAttribute mesa : library ]
++	;
+diff --git a/src/bin/vsynctest/vsynctest.cpp b/src/bin/vsynctest/vsynctest.cpp
+new file mode 100644
+index 0000000000..a4928bc5b3
+--- /dev/null
++++ b/src/bin/vsynctest/vsynctest.cpp
+@@ -0,0 +1,248 @@
++/*
++ * Copyright 2026, hans2294.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*	Checks the retrace semaphore: how often BScreen::WaitForRetrace()
++	returns, and how fast a BGLView swaps with SwapBuffers(true). Both
++	should follow the display's refresh rate. Then BGLView's direct mode in
++	a BDirectWindow: frames per second without vsync through the bitmap and
++	straight to the frame buffer, and whether the last frame is on screen.
++
++	vsynctest
++*/
++
++
++#include <Application.h>
++#include <Bitmap.h>
++#include <DirectWindow.h>
++#include <GLView.h>
++#include <Screen.h>
++#include <Window.h>
++
++#include <GL/gl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++
++static int sFailures;
++
++
++static bool
++near_refresh(double hz, double refresh)
++{
++	return hz > refresh * 0.9 && hz < refresh * 1.1;
++}
++
++
++static double
++refresh_rate(BScreen& screen)
++{
++	display_mode mode;
++	if (screen.GetMode(&mode) != B_OK)
++		return 0;
++	return mode.timing.pixel_clock * 1000.0
++		/ (mode.timing.h_total * mode.timing.v_total);
++}
++
++
++static void
++check_pixel(BScreen& screen, BRect frame, int red, int green, int blue,
++	const char* what)
++{
++	BBitmap* shot = NULL;
++	BRect center(frame.left + 100, frame.top + 100, frame.left + 101,
++		frame.top + 101);
++	uint32 pixel = 0;
++	if (screen.GetBitmap(&shot, false, &center) == B_OK && shot != NULL)
++		pixel = *(uint32*)shot->Bits() & 0xffffff;
++	delete shot;
++	if (abs((int)(pixel >> 16) - red) <= 1
++		&& abs((int)((pixel >> 8) & 0xff) - green) <= 1
++		&& abs((int)(pixel & 0xff) - blue) <= 1)
++		printf("ok    %s (%06" B_PRIx32 ")\n", what, pixel);
++	else {
++		printf("FAIL  %s: %06" B_PRIx32 "\n", what, pixel);
++		sFailures++;
++	}
++}
++
++
++class DirectWindow : public BDirectWindow {
++public:
++	DirectWindow(BRect frame)
++		:
++		BDirectWindow(frame, "vsynctest direct", B_TITLED_WINDOW,
++			B_NOT_RESIZABLE | B_NOT_ZOOMABLE),
++		fView(NULL),
++		fStall(false)
++	{
++	}
++
++	void SetView(BGLView* view)
++	{
++		fView = view;
++	}
++
++	void StallNextConnected()
++	{
++		fStall = true;
++	}
++
++	virtual void DirectConnected(direct_buffer_info* info)
++	{
++		// Longer than app_server waits; it gives up on the window then.
++		if (fStall) {
++			fStall = false;
++			snooze(1000000);
++			return;
++		}
++		if (fView != NULL) {
++			fView->DirectConnected(info);
++			fView->EnableDirectMode(true);
++		}
++		BDirectWindow::DirectConnected(info);
++	}
++
++private:
++	BGLView* fView;
++	bool fStall;
++};
++
++
++static double
++swap_rate(BGLView* view, int frames)
++{
++	view->LockGL();
++	bigtime_t start = system_time();
++	for (int i = 0; i < frames; i++) {
++		float level = (i % 60) / 60.0f;
++		glClearColor(level, 0.2f, 1.0f - level, 1.0f);
++		glClear(GL_COLOR_BUFFER_BIT);
++		view->SwapBuffers();
++	}
++	double rate = frames * 1000000.0 / (system_time() - start);
++	view->UnlockGL();
++	return rate;
++}
++
++
++class TestApp : public BApplication {
++public:
++	TestApp()
++		:
++		BApplication("application/x-vnd.Haiku-vsynctest")
++	{
++	}
++
++	virtual void ReadyToRun()
++	{
++		BScreen screen;
++		double refresh = refresh_rate(screen);
++		printf("      display refresh %.2f Hz\n", refresh);
++
++		const int kFrames = 120;
++		status_t status = screen.WaitForRetrace(1000000);
++		bigtime_t start = system_time();
++		for (int i = 0; i < kFrames && status == B_OK; i++)
++			status = screen.WaitForRetrace(1000000);
++		double hz = kFrames * 1000000.0 / (system_time() - start);
++		if (status == B_OK && near_refresh(hz, refresh))
++			printf("ok    WaitForRetrace: %.2f Hz\n", hz);
++		else {
++			printf("FAIL  WaitForRetrace: %s, %.2f Hz\n", strerror(status), hz);
++			sFailures++;
++		}
++
++		BWindow* window = new BWindow(BRect(100, 100, 355, 355), "vsynctest",
++			B_TITLED_WINDOW, B_NOT_RESIZABLE | B_QUIT_ON_WINDOW_CLOSE);
++		BGLView* view = new BGLView(window->Bounds(), "gl", B_FOLLOW_ALL, 0,
++			BGL_RGB | BGL_DOUBLE);
++		window->AddChild(view);
++		window->Show();
++
++		view->LockGL();
++		start = system_time();
++		for (int i = 0; i < kFrames; i++) {
++			float level = (i % 60) / 60.0f;
++			glClearColor(level, 0.2f, 1.0f - level, 1.0f);
++			glClear(GL_COLOR_BUFFER_BIT);
++			view->SwapBuffers(true);
++		}
++		hz = kFrames * 1000000.0 / (system_time() - start);
++		view->UnlockGL();
++		if (near_refresh(hz, refresh))
++			printf("ok    SwapBuffers(true): %.2f fps\n", hz);
++		else {
++			printf("FAIL  SwapBuffers(true): %.2f fps\n", hz);
++			sFailures++;
++		}
++
++		const int kFastFrames = 600;
++		double bitmapRate = swap_rate(view, kFastFrames);
++		printf("      bitmap path: %.0f fps\n", bitmapRate);
++		window->Lock();
++		window->Quit();
++
++		DirectWindow* direct = new DirectWindow(BRect(400, 100, 655, 355));
++		BGLView* directView = new BGLView(direct->Bounds(), "gl", B_FOLLOW_ALL,
++			0, BGL_RGB | BGL_DOUBLE);
++		direct->SetView(directView);
++		direct->AddChild(directView);
++		direct->Show();
++		snooze(500000);
++		double directRate = swap_rate(directView, kFastFrames);
++		printf("      direct mode: %.0f fps\n", directRate);
++
++		// a known colour, then read the screen where the view is
++		directView->LockGL();
++		glClearColor(0.25f, 0.5f, 0.75f, 1.0f);
++		glClear(GL_COLOR_BUFFER_BIT);
++		directView->SwapBuffers();
++		directView->UnlockGL();
++		direct->Lock();
++		BRect frame = directView->ConvertToScreen(directView->Bounds());
++		direct->Unlock();
++		check_pixel(screen, frame, 64, 128, 191, "last frame on screen");
++
++		// app_server gives up on the window during a move: frames have to
++		// show at the new place all the same
++		direct->StallNextConnected();
++		direct->Lock();
++		direct->MoveBy(300, 200);
++		frame = directView->ConvertToScreen(directView->Bounds());
++		direct->Unlock();
++		snooze(1500000);
++		// A few frames, as a running program draws: with page flipping, the
++		// screen read looks at one of the two screens, and a frame only
++		// reaches the other with the next flip.
++		for (int i = 0; i < 5; i++) {
++			directView->LockGL();
++			glClearColor(0.75f, 0.25f, 0.5f, 1.0f);
++			glClear(GL_COLOR_BUFFER_BIT);
++			directView->SwapBuffers();
++			directView->UnlockGL();
++			snooze(50000);
++		}
++		check_pixel(screen, frame, 191, 64, 128,
++			"frame on screen after app_server gave up");
++		direct->Lock();
++		direct->Quit();
++
++		printf("%s: %d failure(s)\n", sFailures == 0 ? "PASS" : "DONE",
++			sFailures);
++		Quit();
++	}
++};
++
++
++int
++main()
++{
++	setvbuf(stdout, NULL, _IOLBF, 0);
++	TestApp app;
++	app.Run();
++	return sFailures == 0 ? 0 : 1;
++}

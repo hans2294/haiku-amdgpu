@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 11:55:25 +0100
+Subject: [PATCH] haiku-gl: direct mode's own lock, free of waiting for
+ app_server
+
+DrawBitmap() waits for app_server, which held the desktop's lock while it
+waited for DirectConnected(), which waited for fDrawLock. After half a
+second app_server dropped the window for good, and blits went on at its old
+place. The direct mode state now has a lock of its own, which is never held
+while waiting for app_server.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/haiku-gl/GLView.cpp | 45 +++++++++++++++++++++++++----------------
+ 1 file changed, 28 insertions(+), 17 deletions(-)
+
+diff --git a/src/haiku-gl/GLView.cpp b/src/haiku-gl/GLView.cpp
+index 4302ef9..07a8b37 100644
+--- a/src/haiku-gl/GLView.cpp
++++ b/src/haiku-gl/GLView.cpp
+@@ -18,15 +18,22 @@
+  * DRM primary node, is imported as an EGLImage through a dma-buf, and
+  * SwapBuffers() blits the pbuffer into it on the GPU, clipped to the
+  * visible parts of the view that DirectConnected() reported. It finishes
+- * the blit before it lets go of fDrawLock, so a B_DIRECT_STOP (which takes
+- * that lock) returns only once nothing more lands in the frame buffer.
++ * the blit before it lets go of the direct mode's lock, so a B_DIRECT_STOP
++ * (which takes that lock) returns only once nothing more lands in the frame
++ * buffer.
+  * When app_server flips between two screens in one buffer (tear-free
+  * desktop), frames go into both, so whichever is shown next has them.
+  *
+  * Locking: fDisplayLock is the GL lock (LockGL()/UnlockGL(), the context is
+- * current while it is held); fDrawLock guards the bitmap and the direct
+- * mode state. Drawing into the view takes the window's looper lock first
+- * and fDrawLock second, from SwapBuffers() and from Draw() alike.
++ * current while it is held); fDrawLock guards the bitmap. Drawing into the
++ * view takes the window's looper lock first and fDrawLock second, from
++ * SwapBuffers() and from Draw() alike.
++ *
++ * glview_state::directLock guards the direct mode state. Nothing may wait
++ * for app_server while holding it: app_server waits (holding the desktop's
++ * lock) for DirectConnected(), which takes it, and gives up on the window for
++ * good after half a second. Drawing a bitmap waits for app_server, which is
++ * why fDrawLock is another lock.
+  */
+ 
+ // GLView.h brings GL/gl.h, and with it glext.h
+@@ -73,7 +80,8 @@ struct glview_state {
+ 	uint8* staging;			/* glReadPixels() lands here, bottom up */
+ 	size_t stagingSize;
+ 
+-	/* direct mode, under fDrawLock */
++	/* direct mode, under directLock */
++	BLocker directLock;
+ 	bool directEnabled;		/* EnableDirectMode(true) */
+ 	bool directConnected;	/* between B_DIRECT_START and B_DIRECT_STOP */
+ 	bool directFailed;		/* the frame buffer could not be imported */
+@@ -308,7 +316,7 @@ import_screen(glview_state* state)
+ 
+ /*!	Blits the frame into the frame buffer, clipped to the visible parts of
+ 	the view, and waits until it is there. The program's GL state is left
+-	as it was. The context must be current, and fDrawLock held.
++	as it was. The context must be current, and directLock held.
+ */
+ static void
+ blit_to_screen(glview_state* state, bool doubleBuffered)
+@@ -484,7 +492,7 @@ BGLView::SwapBuffers(bool vSync)
+ 		&& !state->directFailed) {
+ 		if (vSync)
+ 			BScreen(Window()).WaitForRetrace(100000);
+-		BAutolock _(fDrawLock);
++		BAutolock _(state->directLock);
+ 		if (state->directConnected && state->screenChanged) {
+ 			release_screen(state);
+ 			state->screenChanged = false;
+@@ -629,12 +637,15 @@ BGLView::Draw(BRect updateRect)
+ 	glview_state* state = state_of(fGc);
+ 	if (state == NULL)
+ 		return;
+-	BAutolock _(fDrawLock);
++	state->directLock.Lock();
+ 	state->viewOffset = view_offset(this);
++	bool direct = state->directEnabled && state->directConnected
++		&& !state->directFailed;
++	state->directLock.Unlock();
++
+ 	// In direct mode the next frame goes to the screen; the bitmap is old.
+-	if (state->bitmap != NULL
+-		&& !(state->directEnabled && state->directConnected
+-			&& !state->directFailed))
++	BAutolock _(fDrawLock);
++	if (state->bitmap != NULL && !direct)
+ 		DrawBitmap(state->bitmap, BPoint(0, 0));
+ }
+ 
+@@ -647,7 +658,7 @@ BGLView::AttachedToWindow()
+ 	if (state != NULL) {
+ 		state->width = Bounds().IntegerWidth() + 1;
+ 		state->height = Bounds().IntegerHeight() + 1;
+-		BAutolock _(fDrawLock);
++		BAutolock _(state->directLock);
+ 		state->viewOffset = view_offset(this);
+ 	}
+ }
+@@ -682,7 +693,7 @@ BGLView::FrameResized(float newWidth, float newHeight)
+ 	if (state != NULL) {
+ 		state->width = (int32)newWidth + 1;
+ 		state->height = (int32)newHeight + 1;
+-		BAutolock _(fDrawLock);
++		BAutolock _(state->directLock);
+ 		state->viewOffset = view_offset(this);
+ 	}
+ 	fBounds = Bounds();
+@@ -750,7 +761,7 @@ BGLView::GetSupportedSuites(BMessage* data)
+ /*!	Called by the BDirectWindow (from its direct daemon) with where the
+ 	window is and which parts of it show. Frames go to the screen from
+ 	B_DIRECT_START until B_DIRECT_STOP; that one returns only after the
+-	last frame's blit is done (SwapBuffers() holds fDrawLock until then).
++	last frame's blit is done (SwapBuffers() holds directLock until then).
+ */
+ void
+ BGLView::DirectConnected(direct_buffer_info* info)
+@@ -759,7 +770,7 @@ BGLView::DirectConnected(direct_buffer_info* info)
+ 	if (state == NULL || info == NULL)
+ 		return;
+ 
+-	BAutolock _(fDrawLock);
++	BAutolock _(state->directLock);
+ 	switch (info->buffer_state & B_DIRECT_MODE_MASK) {
+ 		case B_DIRECT_START:
+ 		case B_DIRECT_MODIFY:
+@@ -800,7 +811,7 @@ BGLView::EnableDirectMode(bool enabled)
+ 	glview_state* state = state_of(fGc);
+ 	if (state == NULL)
+ 		return;
+-	BAutolock _(fDrawLock);
++	BAutolock _(state->directLock);
+ 	state->directEnabled = enabled;
+ }
+ 

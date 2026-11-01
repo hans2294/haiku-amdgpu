@@ -1,0 +1,1663 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:38:23 +0100
+Subject: [PATCH] amdgpu: Linux's amdgpu as a Haiku graphics driver
+
+Builds the unchanged driver from ../linux-6.12 on linuxkpi, and publishes
+/dev/dri/card0, renderD128 and a graphics node for app_server. Only probes the
+GPUs on its device list (default Navi 31), and refuses kernels older than
+hrev60102.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/drivers/graphics/Jamfile   |   1 +
+ .../kernel/drivers/graphics/amdgpu/Jamfile    | 162 ++++
+ .../drivers/graphics/amdgpu/LinuxSources      | 881 ++++++++++++++++++
+ .../kernel/drivers/graphics/amdgpu/driver.cpp | 569 +++++++++++
+ 4 files changed, 1613 insertions(+)
+ create mode 100644 src/add-ons/kernel/drivers/graphics/amdgpu/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/graphics/amdgpu/LinuxSources
+ create mode 100644 src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp
+
+diff --git a/src/add-ons/kernel/drivers/graphics/Jamfile b/src/add-ons/kernel/drivers/graphics/Jamfile
+index cfaa4e4878..70ee5f5d17 100644
+--- a/src/add-ons/kernel/drivers/graphics/Jamfile
++++ b/src/add-ons/kernel/drivers/graphics/Jamfile
+@@ -1,6 +1,7 @@
+ SubDir HAIKU_TOP src add-ons kernel drivers graphics ;
+ 
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics 3dfx ;
++SubInclude HAIKU_TOP src add-ons kernel drivers graphics amdgpu ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics ati ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics common ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers graphics et6x00 ;
+diff --git a/src/add-ons/kernel/drivers/graphics/amdgpu/Jamfile b/src/add-ons/kernel/drivers/graphics/amdgpu/Jamfile
+new file mode 100644
+index 0000000000..775e884499
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/graphics/amdgpu/Jamfile
+@@ -0,0 +1,162 @@
++SubDir HAIKU_TOP src add-ons kernel drivers graphics amdgpu ;
++
++# Linux's amdgpu (with DRM, TTM, the scheduler and dma-buf) from the unchanged
++# Linux tree next to Haiku's, on top of linuxkpi. The Linux files never see
++# Haiku's headers: they are compiled with their own flags, as Kbuild would.
++
++LINUX_TOP = [ FDirName $(HAIKU_TOP) .. linux-6.12 ] ;
++LINUXKPI_TOP = [ FDirName $(HAIKU_TOP) src libs compat linuxkpi ] ;
++LINUX_CC = $(TARGET_CC_$(TARGET_KERNEL_ARCH)) ;
++
++LINUX_CCFLAGS = -std=gnu11 -O2 -nostdinc -ffreestanding
++	-fno-strict-aliasing -fno-delete-null-pointer-checks -fno-common
++	-fno-tree-vectorize -mno-red-zone -fno-omit-frame-pointer
++	-D__KERNEL__ -D__HAIKU_LINUXKPI__
++	-Werror=implicit-function-declaration -Werror=implicit-int
++	-Wno-override-init -Wno-unused-parameter -Wno-attributes ;
++
++LINUX_HDRS =
++	[ FDirName $(LINUXKPI_TOP) include ]
++	[ FDirName $(LINUXKPI_TOP) linux-include ]
++	[ FDirName $(LINUX_TOP) include uapi ] ;
++
++local amd = [ FDirName $(LINUX_TOP) drivers gpu drm amd ] ;
++LINUX_AMD_HDRS =
++	$(amd)/include/asic_reg $(amd)/include $(amd)/acp/include $(amd)/amdgpu
++	$(amd)/amdkfd $(amd)/display $(amd)/display/amdgpu_dm $(amd)/display/dc
++	$(amd)/display/include $(amd)/display/modules/inc $(amd)/pm/inc
++	$(amd)/pm/legacy-dpm $(amd)/pm/powerplay/hwmgr $(amd)/pm/powerplay/inc
++	$(amd)/pm/powerplay/smumgr $(amd)/pm/swsmu $(amd)/pm/swsmu/inc
++	$(amd)/pm/swsmu/inc/pmfw_if $(amd)/pm/swsmu/smu11 $(amd)/pm/swsmu/smu12
++	$(amd)/pm/swsmu/smu13 $(amd)/pm/swsmu/smu14 ;
++
++# Display Core's, which its Makefiles add per sub-tree
++local dc = $(amd)/display/dc ;
++LINUX_AMD_HDRS +=
++	$(dc)/inc $(dc)/inc/hw $(dc)/clk_mgr $(dc)/dccg $(dc)/dio $(dc)/dpp $(dc)/dsc
++	$(dc)/dwb $(dc)/hpo $(dc)/hubbub $(dc)/hubp $(dc)/hwss $(dc)/mmhubbub
++	$(dc)/mpc $(dc)/opp $(dc)/optc $(dc)/pg $(dc)/resource
++	$(dc)/dml2 $(dc)/dml2/dml21 $(dc)/dml2/dml21/inc $(dc)/dml2/dml21/src/inc
++	$(dc)/dml2/dml21/src/dml2_core $(dc)/dml2/dml21/src/dml2_dpmm
++	$(dc)/dml2/dml21/src/dml2_mcg $(dc)/dml2/dml21/src/dml2_pmo
++	$(dc)/dml2/dml21/src/dml2_standalone_libraries
++	$(amd)/display/dmub/inc $(amd)/display/modules/color
++	$(amd)/display/modules/freesync $(amd)/display/modules/hdcp
++	$(amd)/display/modules/info_packet $(amd)/display/modules/power ;
++
++# linuxkpi's headers change a lot; rebuild the Linux objects when they do.
++local kpiDirs = linux linux/device linux/sched linux/mfd linux/byteorder
++	asm asm/fpu trace video acpi xen kunit generated uapi/linux/sched ;
++LINUXKPI_HEADERS = ;
++local dir ;
++for dir in $(kpiDirs) {
++	LINUXKPI_HEADERS += [ GLOB [ FDirName $(LINUXKPI_TOP) include $(dir) ] : *.h ] ;
++}
++
++rule LinuxObject
++{
++	# LinuxObject <root> : <path below root> : <KBUILD_MODNAME> ;
++	# Compiles one Linux-API C file; returns the object.
++	local root = $(1) ;
++	local path = $(2) ;
++	local source = <linux-src>$(path) ;
++	local object = $(path:B).o ;
++	object = $(object:G=linux-obj-$(path:D)) ;
++
++	SEARCH on $(source) = $(root) ;
++	MakeLocate $(object) : [ FDirName $(LOCATE_TARGET) linux $(path:D) ] ;
++	Depends $(object) : $(source) $(LINUXKPI_HEADERS) ;
++
++	LINUX_MODNAME on $(object) = $(3) ;
++	LINUX_BASENAME on $(object) = $(path:B) ;
++	local hdrs = $(LINUX_HDRS) [ FDirName $(root) $(path:D) ] ;
++	if $(3) = amdgpu {
++		hdrs += $(LINUX_AMD_HDRS) ;
++	}
++	LINUX_OBJECT_HDRS on $(object) = $(hdrs) ;
++	LINUX_KCONFIG on $(object)
++		= [ FDirName $(LINUXKPI_TOP) include linux kconfig.h ] ;
++
++	LinuxCompile $(object) : $(source) ;
++	return $(object) ;
++}
++
++actions LinuxCompile
++{
++	$(LINUX_CC) -c $(LINUX_CCFLAGS) \
++		-isystem `$(LINUX_CC) -print-file-name=include` \
++		-DKBUILD_MODNAME='"$(LINUX_MODNAME)"' \
++		-DKBUILD_BASENAME='"$(LINUX_BASENAME)"' \
++		-include $(LINUX_KCONFIG) -I$(LINUX_OBJECT_HDRS) \
++		-o "$(1)" "$(2)"
++}
++
++include [ FDirName $(SUBDIR) LinuxSources ] ;
++
++local linuxObjects ;
++local sources = $(LINUX_SOURCES) ;
++while $(sources) {
++	linuxObjects += [ LinuxObject $(LINUX_TOP) : $(sources[1]) : $(sources[2]) ] ;
++	sources = $(sources[3-]) ;
++}
++
++# linuxkpi's Linux side: the Linux API in C, compiled like Linux code
++LINUXKPI_LINUX_SOURCES =
++	chrdev.c
++	device.c
++	dma.c
++	irq.c
++	lib.c
++	misc.c
++	mm.c
++	module.c
++	pci.c
++	printk.c
++	sched.c
++	sync.c
++	timer.c
++	vsprintf.c
++	;
++local file ;
++for file in $(LINUXKPI_LINUX_SOURCES) {
++	linuxObjects += [ LinuxObject [ FDirName $(LINUXKPI_TOP) linux ]
++		: $(file) : linuxkpi ] ;
++}
++
++# One merged object rather than an archive: nothing refers to most Linux
++# modules except through their init call entries, and the linker would leave
++# them out of an archive.
++rule LinuxMerge
++{
++	# LinuxMerge <object> : <objects> ;
++	MakeLocate $(1) : $(LOCATE_TARGET) ;
++	Depends $(1) : $(2) ;
++	LinuxMergeObjects $(1) : $(2) ;
++}
++
++actions LinuxMergeObjects
++{
++	$(LINUX_CC) -nostdlib -r -o "$(1)" "$(2)"
++}
++
++LinuxMerge <linux>linux_amdgpu.o : $(linuxObjects) ;
++
++# linuxkpi's Haiku side and the driver glue, with Haiku's headers
++UsePrivateKernelHeaders ;
++UsePrivateHeaders [ FDirName graphics common ] ;
++SubDirHdrs [ FDirName $(LINUXKPI_TOP) haiku ] ;
++SEARCH_SOURCE += [ FDirName $(LINUXKPI_TOP) haiku ] ;
++
++KernelAddon amdgpu :
++	driver.cpp
++	haiku_device.cpp
++	haiku_kernel.cpp
++	;
++
++# Haiku's loader binds an add-on's global symbols to the kernel's first;
++# Linux's vsnprintf(), sort() and friends must bind to linuxkpi's own.
++LINKFLAGS on amdgpu += -Xlinker -Bsymbolic ;
++
++# Straight onto the link line; LinkAgainst would turn it into -l.
++LINK_BEGIN_GLUE on amdgpu += <linux>linux_amdgpu.o ;
++Depends amdgpu : <linux>linux_amdgpu.o ;
+diff --git a/src/add-ons/kernel/drivers/graphics/amdgpu/LinuxSources b/src/add-ons/kernel/drivers/graphics/amdgpu/LinuxSources
+new file mode 100644
+index 0000000000..a670441b90
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/graphics/amdgpu/LinuxSources
+@@ -0,0 +1,881 @@
++# Generated by port/gen-jam-sources.sh from port/files.txt; do not edit.
++# Pairs of <path in linux-6.12> <KBUILD_MODNAME>.
++LINUX_SOURCES =
++	drivers/dma-buf/dma-buf.c dma_buf
++	drivers/dma-buf/dma-fence-array.c dma_buf
++	drivers/dma-buf/dma-fence.c dma_buf
++	drivers/dma-buf/dma-fence-chain.c dma_buf
++	drivers/dma-buf/dma-fence-unwrap.c dma_buf
++	drivers/dma-buf/dma-resv.c dma_buf
++	drivers/dma-buf/sync_file.c dma_buf
++	drivers/gpu/buddy.c linuxkpi_lib
++	drivers/gpu/drm/amd/amdgpu/aldebaran.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/aldebaran_reg_init.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_aca.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_afmt.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_atomfirmware.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_benchmark.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_bios.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_cgs.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_connectors.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_csa.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_ctx.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_dev_coredump.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_device.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_display.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_doorbell_mgr.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_eeprom.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_encoders.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_fru_eeprom.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_fw_attestation.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_gart.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_gtt_mgr.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_hdp.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_i2c.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_ids.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_job.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_jpeg.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_lsdma.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_mca.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_mes.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_mmhub.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_nbio.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_object.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_pll.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_preempt_mgr.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_psp_ta.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_rap.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_ras.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_ras_eeprom.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_reset.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_ring.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_ring_mux.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_rlc.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_sa.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_sched.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_sdma.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_securedisplay.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_seq64.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_trace_points.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_umc.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_umsch_mm.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_uvd.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_vf_error.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_vkms.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_vm_cpu.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_vm_pt.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_vm_sdma.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_vm_tlb_fence.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_vpe.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_xcp.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/amdgpu_xgmi.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/aqua_vanjaram.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/arct_reg_init.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/athub_v1_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/athub_v2_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/athub_v2_1.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/athub_v3_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/athub_v4_1_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/atombios_crtc.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/atombios_dp.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/atombios_encoders.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/atombios_i2c.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/atom.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/cyan_skillfish_reg_init.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/cz_ih.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/dce_v10_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/dce_v11_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/df_v1_7.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/df_v3_6.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/df_v4_15.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/df_v4_3.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/df_v4_6_2.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/emu_soc.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfxhub_v1_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfxhub_v11_5_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfxhub_v1_1.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfxhub_v12_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfxhub_v1_2.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfxhub_v2_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfxhub_v2_1.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfxhub_v3_0_3.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfxhub_v3_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfx_v11_0_3.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfx_v12_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfx_v9_4_2.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfx_v9_4_3.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gfx_v9_4.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gmc_v12_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gmc_v7_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gmc_v8_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/gmc_v9_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/hdp_v4_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/hdp_v5_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/hdp_v5_2.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/hdp_v6_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/hdp_v7_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/iceland_ih.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/ih_v6_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/ih_v6_1.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/ih_v7_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/imu_v11_0_3.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/imu_v11_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/imu_v12_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/jpeg_v1_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/jpeg_v2_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/jpeg_v2_5.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/jpeg_v3_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/jpeg_v4_0_3.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/jpeg_v4_0_5.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/jpeg_v4_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/jpeg_v5_0_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/lsdma_v6_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/lsdma_v7_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/mca_v3_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/mes_v11_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/mes_v12_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/mmhub_v1_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/mmhub_v1_7.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/mmhub_v1_8.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/mmhub_v2_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/mmhub_v2_3.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/mmhub_v3_0_1.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/mmhub_v3_0_2.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/mmhub_v3_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/mmhub_v3_3.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/mmhub_v4_1_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/mmhub_v9_4.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/mxgpu_ai.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/mxgpu_nv.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/mxgpu_vi.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/navi10_ih.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/nbio_v2_3.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/nbio_v4_3.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/nbio_v7_11.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/nbio_v7_2.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/nbio_v7_4.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/nbio_v7_7.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/nbio_v7_9.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/nv.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/psp_v10_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/psp_v11_0_8.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/psp_v11_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/psp_v12_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/psp_v13_0_4.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/psp_v13_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/psp_v14_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/psp_v3_1.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/sdma_v2_4.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/sdma_v3_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/sdma_v4_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/sdma_v4_4_2.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/sdma_v4_4.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/sdma_v5_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/sdma_v5_2.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/sdma_v6_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/sdma_v7_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/sienna_cichlid.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/smuio_v11_0_6.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/smuio_v11_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/smuio_v13_0_3.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/smuio_v13_0_6.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/smuio_v13_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/smuio_v14_0_2.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/smuio_v9_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/smu_v11_0_i2c.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/smu_v13_0_10.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/soc15.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/soc21.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/soc24.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/tonga_ih.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/umc_v12_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/umc_v6_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/umc_v6_1.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/umc_v6_7.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/umc_v8_10.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/umc_v8_7.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/umsch_mm_v4_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/uvd_v5_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/uvd_v6_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/uvd_v7_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/vce_v3_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/vce_v4_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/vcn_sw_ring.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/vcn_v1_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/vcn_v2_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/vcn_v2_5.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/vcn_v3_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/vcn_v4_0_3.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/vcn_v4_0_5.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/vcn_v5_0_0.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/vega10_ih.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/vega10_reg_init.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/vega20_ih.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/vega20_reg_init.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/vi.c amdgpu
++	drivers/gpu/drm/amd/amdgpu/vpe_v6_1.c amdgpu
++	drivers/gpu/drm/amd/amdxcp/amdgpu_xcp_drv.c amdgpu
++	drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c amdgpu
++	drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_color.c amdgpu
++	drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crtc.c amdgpu
++	drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_hdcp.c amdgpu
++	drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c amdgpu
++	drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq.c amdgpu
++	drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c amdgpu
++	drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_plane.c amdgpu
++	drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_pp_smu.c amdgpu
++	drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_psr.c amdgpu
++	drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_replay.c amdgpu
++	drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_services.c amdgpu
++	drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_wb.c amdgpu
++	drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/basics/bw_fixed.c amdgpu
++	drivers/gpu/drm/amd/display/dc/basics/conversion.c amdgpu
++	drivers/gpu/drm/amd/display/dc/basics/custom_float.c amdgpu
++	drivers/gpu/drm/amd/display/dc/basics/dc_common.c amdgpu
++	drivers/gpu/drm/amd/display/dc/basics/dce_calcs.c amdgpu
++	drivers/gpu/drm/amd/display/dc/basics/fixpt31_32.c amdgpu
++	drivers/gpu/drm/amd/display/dc/basics/vector.c amdgpu
++	drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c amdgpu
++	drivers/gpu/drm/amd/display/dc/bios/bios_parser.c amdgpu
++	drivers/gpu/drm/amd/display/dc/bios/bios_parser_common.c amdgpu
++	drivers/gpu/drm/amd/display/dc/bios/bios_parser_helper.c amdgpu
++	drivers/gpu/drm/amd/display/dc/bios/bios_parser_interface.c amdgpu
++	drivers/gpu/drm/amd/display/dc/bios/command_table2.c amdgpu
++	drivers/gpu/drm/amd/display/dc/bios/command_table.c amdgpu
++	drivers/gpu/drm/amd/display/dc/bios/command_table_helper2.c amdgpu
++	drivers/gpu/drm/amd/display/dc/bios/command_table_helper.c amdgpu
++	drivers/gpu/drm/amd/display/dc/bios/dce110/command_table_helper_dce110.c amdgpu
++	drivers/gpu/drm/amd/display/dc/bios/dce112/command_table_helper2_dce112.c amdgpu
++	drivers/gpu/drm/amd/display/dc/bios/dce112/command_table_helper_dce112.c amdgpu
++	drivers/gpu/drm/amd/display/dc/bios/dce80/command_table_helper_dce80.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dce100/dce_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dce110/dce110_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dce112/dce112_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dce120/dce120_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn10/rv1_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn10/rv1_clk_mgr_vbios_smu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn10/rv2_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn201/dcn201_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn20/dcn20_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn21/rn_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn21/rn_clk_mgr_vbios_smu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn301/dcn301_smu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn301/vg_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn30/dcn30_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn30/dcn30_clk_mgr_smu_msg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn314/dcn314_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn314/dcn314_smu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn315/dcn315_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn315/dcn315_smu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn316/dcn316_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn316/dcn316_smu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn31/dcn31_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn31/dcn31_smu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn32/dcn32_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn32/dcn32_clk_mgr_smu_msg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn35/dcn351_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn35/dcn35_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn35/dcn35_smu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr_smu_msg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/core/dc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/core/dc_debug.c amdgpu
++	drivers/gpu/drm/amd/display/dc/core/dc_hw_sequencer.c amdgpu
++	drivers/gpu/drm/amd/display/dc/core/dc_link_enc_cfg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/core/dc_link_exports.c amdgpu
++	drivers/gpu/drm/amd/display/dc/core/dc_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/core/dc_sink.c amdgpu
++	drivers/gpu/drm/amd/display/dc/core/dc_stat.c amdgpu
++	drivers/gpu/drm/amd/display/dc/core/dc_state.c amdgpu
++	drivers/gpu/drm/amd/display/dc/core/dc_stream.c amdgpu
++	drivers/gpu/drm/amd/display/dc/core/dc_surface.c amdgpu
++	drivers/gpu/drm/amd/display/dc/core/dc_vm_helper.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dccg/dcn201/dcn201_dccg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dccg/dcn20/dcn20_dccg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dccg/dcn21/dcn21_dccg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dccg/dcn301/dcn301_dccg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dccg/dcn30/dcn30_dccg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dccg/dcn314/dcn314_dccg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dccg/dcn31/dcn31_dccg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dccg/dcn32/dcn32_dccg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dccg/dcn35/dcn35_dccg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dccg/dcn401/dcn401_dccg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce110/dce110_compressor.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input_v.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_csc_v.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_regamma_v.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_v.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator_v.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce110/dce110_transform_v.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce112/dce112_compressor.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce120/dce120_timing_generator.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce80/dce80_timing_generator.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dce_abm.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dce_audio.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dce_aux.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dce_clock_source.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dce_dmcu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dce_i2c.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dce_i2c_hw.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dce_i2c_sw.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dce_ipp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dce_mem_input.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dce_opp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dce_panel_cntl.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dce_scl_filters.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dce_stream_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dce_transform.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dc_edid_parser.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dmub_abm.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dmub_abm_lcd.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dmub_hw_lock_mgr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dmub_outbox.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dmub_psr.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dce/dmub_replay.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dc_helper.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn10/dcn10_cm_common.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer_debug.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn10/dcn10_ipp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn201/dcn201_mpc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn201/dcn201_opp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn20/dcn20_dwb.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn20/dcn20_dwb_scl.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn20/dcn20_vmid.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn21/dcn21_link_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn301/dcn301_panel_cntl.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn30/dcn30_afmt.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn30/dcn30_cm_common.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn30/dcn30_mmhubbub.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn30/dcn30_vpg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn31/dcn31_afmt.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn31/dcn31_apg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn31/dcn31_panel_cntl.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dcn31/dcn31_vpg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dc_spl_translate.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dio/dcn10/dcn10_link_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dio/dcn10/dcn10_stream_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dio/dcn20/dcn20_link_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dio/dcn20/dcn20_stream_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dio/dcn301/dcn301_dio_link_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dio/dcn30/dcn30_dio_link_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dio/dcn30/dcn30_dio_stream_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dio/dcn314/dcn314_dio_stream_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dio/dcn31/dcn31_dio_link_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dio/dcn321/dcn321_dio_link_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dio/dcn32/dcn32_dio_link_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dio/dcn32/dcn32_dio_stream_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dio/dcn35/dcn35_dio_link_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dio/dcn35/dcn35_dio_stream_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dio/dcn401/dcn401_dio_link_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dio/dcn401/dcn401_dio_stream_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/display_mode_core.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/display_mode_util.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_translation_helper.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_utils.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/dml21_wrapper.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_core/dml2_core_dcn4.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_core/dml2_core_dcn4_calcs.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_core/dml2_core_factory.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_dpmm/dml2_dpmm_dcn4.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_dpmm/dml2_dpmm_factory.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_mcg/dml2_mcg_dcn4.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_mcg/dml2_mcg_factory.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_pmo/dml2_pmo_dcn3.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_pmo/dml2_pmo_dcn4_fams2.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_pmo/dml2_pmo_factory.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_standalone_libraries/lib_float_math.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_top/dml2_top_optimization.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_top/dml_top.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/src/dml2_top/dml_top_mcache.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml21/src/inc/dml2_debug.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml2_dc_resource_mgmt.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml2_mall_phantom.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml2_policy.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml2_translation_helper.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml2_utils.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml2_wrapper.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml2/dml_display_rq_dlg_calc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/calcs/dcn_calc_auto.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/calcs/dcn_calc_math.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/calcs/dcn_calcs.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn10/dcn10_fpu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn20/display_mode_vba_20.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn20/display_mode_vba_20v2.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn20/display_rq_dlg_calc_20.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn20/display_rq_dlg_calc_20v2.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn21/display_mode_vba_21.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn21/display_rq_dlg_calc_21.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn301/dcn301_fpu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn302/dcn302_fpu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn303/dcn303_fpu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn30/dcn30_fpu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn30/display_mode_vba_30.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn30/display_rq_dlg_calc_30.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn314/dcn314_fpu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn314/display_mode_vba_314.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn314/display_rq_dlg_calc_314.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn31/dcn31_fpu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn31/display_mode_vba_31.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn31/display_rq_dlg_calc_31.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn321/dcn321_fpu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn32/dcn32_fpu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn32/display_mode_vba_32.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn32/display_mode_vba_util_32.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn32/display_rq_dlg_calc_32.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn351/dcn351_fpu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn35/dcn35_fpu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dcn401/dcn401_fpu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/display_mode_lib.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/display_mode_vba.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/display_rq_dlg_helpers.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dml1_display_rq_dlg_calc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dml/dsc/rc_calc_fpu.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dpp/dcn10/dcn10_dpp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dpp/dcn10/dcn10_dpp_cm.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dpp/dcn10/dcn10_dpp_dscl.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dpp/dcn201/dcn201_dpp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dpp/dcn20/dcn20_dpp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dpp/dcn20/dcn20_dpp_cm.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dpp/dcn30/dcn30_dpp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dpp/dcn30/dcn30_dpp_cm.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dpp/dcn32/dcn32_dpp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dpp/dcn35/dcn35_dpp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dpp/dcn401/dcn401_dpp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dpp/dcn401/dcn401_dpp_cm.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dpp/dcn401/dcn401_dpp_dscl.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dsc/dc_dsc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dsc/dcn20/dcn20_dsc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dsc/dcn35/dcn35_dsc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dsc/dcn401/dcn401_dsc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dsc/rc_calc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dsc/rc_calc_dpi.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dwb/dcn30/dcn30_dwb.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dwb/dcn30/dcn30_dwb_cm.c amdgpu
++	drivers/gpu/drm/amd/display/dc/dwb/dcn35/dcn35_dwb.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dce110/hw_factory_dce110.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dce110/hw_translate_dce110.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dce120/hw_factory_dce120.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dce120/hw_translate_dce120.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dce80/hw_factory_dce80.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dce80/hw_translate_dce80.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dcn10/hw_factory_dcn10.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dcn10/hw_translate_dcn10.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dcn20/hw_factory_dcn20.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dcn20/hw_translate_dcn20.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dcn21/hw_factory_dcn21.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dcn21/hw_translate_dcn21.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dcn30/hw_factory_dcn30.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dcn30/hw_translate_dcn30.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dcn315/hw_factory_dcn315.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dcn315/hw_translate_dcn315.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dcn32/hw_factory_dcn32.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dcn32/hw_translate_dcn32.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dcn401/hw_factory_dcn401.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/dcn401/hw_translate_dcn401.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/gpio_base.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/gpio_service.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/hw_ddc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/hw_factory.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/hw_generic.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/hw_gpio.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/hw_hpd.c amdgpu
++	drivers/gpu/drm/amd/display/dc/gpio/hw_translate.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hdcp/hdcp_msg.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hpo/dcn31/dcn31_hpo_dp_link_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hpo/dcn31/dcn31_hpo_dp_stream_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hpo/dcn32/dcn32_hpo_dp_link_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubbub/dcn10/dcn10_hubbub.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubbub/dcn201/dcn201_hubbub.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubbub/dcn20/dcn20_hubbub.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubbub/dcn21/dcn21_hubbub.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubbub/dcn301/dcn301_hubbub.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubbub/dcn30/dcn30_hubbub.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubbub/dcn31/dcn31_hubbub.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubbub/dcn32/dcn32_hubbub.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubbub/dcn35/dcn35_hubbub.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubbub/dcn401/dcn401_hubbub.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubp/dcn10/dcn10_hubp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubp/dcn201/dcn201_hubp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubp/dcn20/dcn20_hubp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubp/dcn21/dcn21_hubp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubp/dcn30/dcn30_hubp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubp/dcn31/dcn31_hubp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubp/dcn32/dcn32_hubp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubp/dcn35/dcn35_hubp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hubp/dcn401/dcn401_hubp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dce100/dce100_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dce112/dce112_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dce120/dce120_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dce80/dce80_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dce/dce_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn10/dcn10_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn10/dcn10_init.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn201/dcn201_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn201/dcn201_init.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_init.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn21/dcn21_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn21/dcn21_init.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn301/dcn301_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn301/dcn301_init.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn302/dcn302_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn302/dcn302_init.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn303/dcn303_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn303/dcn303_init.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn30/dcn30_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn30/dcn30_init.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn314/dcn314_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn314/dcn314_init.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn31/dcn31_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn31/dcn31_init.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn32/dcn32_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn32/dcn32_init.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn351/dcn351_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn351/dcn351_init.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn35/dcn35_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn35/dcn35_init.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c amdgpu
++	drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_init.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/dce110/irq_service_dce110.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/dce120/irq_service_dce120.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/dce80/irq_service_dce80.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/dcn10/irq_service_dcn10.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/dcn201/irq_service_dcn201.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/dcn20/irq_service_dcn20.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/dcn21/irq_service_dcn21.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/dcn302/irq_service_dcn302.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/dcn303/irq_service_dcn303.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/dcn30/irq_service_dcn30.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/dcn314/irq_service_dcn314.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/dcn315/irq_service_dcn315.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/dcn31/irq_service_dcn31.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/dcn32/irq_service_dcn32.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/dcn351/irq_service_dcn351.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/dcn35/irq_service_dcn35.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/dcn401/irq_service_dcn401.c amdgpu
++	drivers/gpu/drm/amd/display/dc/irq/irq_service.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/accessories/link_dp_cts.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/accessories/link_dp_trace.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dio.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dio_fixed_vs_pe_retimer.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dpia.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_hpo_dp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_hpo_fixed_vs_pe_retimer_dp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/link_detection.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/link_dpms.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/link_factory.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/link_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/link_validation.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/protocols/link_dpcd.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_dpia_bw.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_dpia.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_irq_handler.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_phy.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training_128b_132b.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training_8b_10b.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training_auxless.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training_dpia.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training_fixed_vs_pe_retimer.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/protocols/link_edp_panel_control.c amdgpu
++	drivers/gpu/drm/amd/display/dc/link/protocols/link_hpd.c amdgpu
++	drivers/gpu/drm/amd/display/dc/mmhubbub/dcn20/dcn20_mmhubbub.c amdgpu
++	drivers/gpu/drm/amd/display/dc/mmhubbub/dcn32/dcn32_mmhubbub.c amdgpu
++	drivers/gpu/drm/amd/display/dc/mmhubbub/dcn35/dcn35_mmhubbub.c amdgpu
++	drivers/gpu/drm/amd/display/dc/mpc/dcn10/dcn10_mpc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/mpc/dcn20/dcn20_mpc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/mpc/dcn30/dcn30_mpc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/mpc/dcn32/dcn32_mpc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/mpc/dcn401/dcn401_mpc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/opp/dcn10/dcn10_opp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/opp/dcn20/dcn20_opp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/opp/dcn35/dcn35_opp.c amdgpu
++	drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/optc/dcn201/dcn201_optc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/optc/dcn20/dcn20_optc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/optc/dcn301/dcn301_optc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/optc/dcn30/dcn30_optc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/optc/dcn314/dcn314_optc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/optc/dcn31/dcn31_optc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/optc/dcn32/dcn32_optc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/optc/dcn35/dcn35_optc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/optc/dcn401/dcn401_optc.c amdgpu
++	drivers/gpu/drm/amd/display/dc/pg/dcn35/dcn35_pg_cntl.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dce100/dce100_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dce110/dce110_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dce112/dce112_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dce120/dce120_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dce80/dce80_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn10/dcn10_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn20/dcn20_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn21/dcn21_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn301/dcn301_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn302/dcn302_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn303/dcn303_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn30/dcn30_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn314/dcn314_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn315/dcn315_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn316/dcn316_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn31/dcn31_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn321/dcn321_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn32/dcn32_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn32/dcn32_resource_helpers.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn351/dcn351_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn35/dcn35_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c amdgpu
++	drivers/gpu/drm/amd/display/dc/spl/dc_spl.c amdgpu
++	drivers/gpu/drm/amd/display/dc/spl/dc_spl_filters.c amdgpu
++	drivers/gpu/drm/amd/display/dc/spl/dc_spl_isharp_filters.c amdgpu
++	drivers/gpu/drm/amd/display/dc/spl/dc_spl_scl_easf_filters.c amdgpu
++	drivers/gpu/drm/amd/display/dc/spl/dc_spl_scl_filters.c amdgpu
++	drivers/gpu/drm/amd/display/dc/spl/spl_custom_float.c amdgpu
++	drivers/gpu/drm/amd/display/dc/spl/spl_fixpt31_32.c amdgpu
++	drivers/gpu/drm/amd/display/dc/virtual/virtual_link_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dc/virtual/virtual_link_hwss.c amdgpu
++	drivers/gpu/drm/amd/display/dc/virtual/virtual_stream_encoder.c amdgpu
++	drivers/gpu/drm/amd/display/dmub/src/dmub_dcn20.c amdgpu
++	drivers/gpu/drm/amd/display/dmub/src/dmub_dcn21.c amdgpu
++	drivers/gpu/drm/amd/display/dmub/src/dmub_dcn301.c amdgpu
++	drivers/gpu/drm/amd/display/dmub/src/dmub_dcn302.c amdgpu
++	drivers/gpu/drm/amd/display/dmub/src/dmub_dcn303.c amdgpu
++	drivers/gpu/drm/amd/display/dmub/src/dmub_dcn30.c amdgpu
++	drivers/gpu/drm/amd/display/dmub/src/dmub_dcn314.c amdgpu
++	drivers/gpu/drm/amd/display/dmub/src/dmub_dcn315.c amdgpu
++	drivers/gpu/drm/amd/display/dmub/src/dmub_dcn316.c amdgpu
++	drivers/gpu/drm/amd/display/dmub/src/dmub_dcn31.c amdgpu
++	drivers/gpu/drm/amd/display/dmub/src/dmub_dcn32.c amdgpu
++	drivers/gpu/drm/amd/display/dmub/src/dmub_dcn351.c amdgpu
++	drivers/gpu/drm/amd/display/dmub/src/dmub_dcn35.c amdgpu
++	drivers/gpu/drm/amd/display/dmub/src/dmub_dcn401.c amdgpu
++	drivers/gpu/drm/amd/display/dmub/src/dmub_reg.c amdgpu
++	drivers/gpu/drm/amd/display/dmub/src/dmub_srv.c amdgpu
++	drivers/gpu/drm/amd/display/dmub/src/dmub_srv_stat.c amdgpu
++	drivers/gpu/drm/amd/display/modules/color/color_gamma.c amdgpu
++	drivers/gpu/drm/amd/display/modules/color/color_table.c amdgpu
++	drivers/gpu/drm/amd/display/modules/freesync/freesync.c amdgpu
++	drivers/gpu/drm/amd/display/modules/hdcp/hdcp1_execution.c amdgpu
++	drivers/gpu/drm/amd/display/modules/hdcp/hdcp1_transition.c amdgpu
++	drivers/gpu/drm/amd/display/modules/hdcp/hdcp2_execution.c amdgpu
++	drivers/gpu/drm/amd/display/modules/hdcp/hdcp2_transition.c amdgpu
++	drivers/gpu/drm/amd/display/modules/hdcp/hdcp.c amdgpu
++	drivers/gpu/drm/amd/display/modules/hdcp/hdcp_ddc.c amdgpu
++	drivers/gpu/drm/amd/display/modules/hdcp/hdcp_log.c amdgpu
++	drivers/gpu/drm/amd/display/modules/hdcp/hdcp_psp.c amdgpu
++	drivers/gpu/drm/amd/display/modules/info_packet/info_packet.c amdgpu
++	drivers/gpu/drm/amd/display/modules/power/power_helpers.c amdgpu
++	drivers/gpu/drm/amd/pm/amdgpu_dpm.c amdgpu
++	drivers/gpu/drm/amd/pm/amdgpu_dpm_internal.c amdgpu
++	drivers/gpu/drm/amd/pm/amdgpu_pm.c amdgpu
++	drivers/gpu/drm/amd/pm/legacy-dpm/legacy_dpm.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/amd_powerplay.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/ci_baco.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/common_baco.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/fiji_baco.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/hardwaremanager.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/hwmgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/polaris_baco.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/ppatomctrl.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/ppatomfwctrl.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/pp_overdriver.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/pppcielanes.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/pp_psm.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/processpptables.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/process_pptables_v1_0.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/smu10_hwmgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/smu7_baco.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/smu7_clockpowergating.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/smu7_hwmgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/smu7_powertune.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/smu7_thermal.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/smu8_hwmgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/smu9_baco.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/smu_helper.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/tonga_baco.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/vega10_baco.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/vega10_hwmgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/vega10_powertune.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/vega10_processpptables.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/vega10_thermal.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/vega12_baco.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/vega12_hwmgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/vega12_processpptables.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/vega12_thermal.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/vega20_baco.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/vega20_hwmgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/vega20_powertune.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/vega20_processpptables.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/hwmgr/vega20_thermal.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/smumgr/ci_smumgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/smumgr/fiji_smumgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/smumgr/iceland_smumgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/smumgr/polaris10_smumgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/smumgr/smu10_smumgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/smumgr/smu7_smumgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/smumgr/smu8_smumgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/smumgr/smu9_smumgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/smumgr/smumgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/smumgr/tonga_smumgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/smumgr/vega10_smumgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/smumgr/vega12_smumgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/smumgr/vega20_smumgr.c amdgpu
++	drivers/gpu/drm/amd/pm/powerplay/smumgr/vegam_smumgr.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/amdgpu_smu.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu11/arcturus_ppt.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu11/cyan_skillfish_ppt.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu11/navi10_ppt.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu11/smu_v11_0.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu11/vangogh_ppt.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu12/renoir_ppt.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu12/smu_v12_0.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu13/aldebaran_ppt.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_0_ppt.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_4_ppt.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_5_ppt.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_6_ppt.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0_7_ppt.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu13/smu_v13_0.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu13/yellow_carp_ppt.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_0_ppt.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_2_ppt.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0.c amdgpu
++	drivers/gpu/drm/amd/pm/swsmu/smu_cmn.c amdgpu
++	drivers/gpu/drm/display/drm_display_helper_mod.c drm_display_helper
++	drivers/gpu/drm/display/drm_dp_dual_mode_helper.c drm_display_helper
++	drivers/gpu/drm/display/drm_dp_helper.c drm_display_helper
++	drivers/gpu/drm/display/drm_dp_mst_topology.c drm_display_helper
++	drivers/gpu/drm/display/drm_dsc_helper.c drm_display_helper
++	drivers/gpu/drm/display/drm_hdcp_helper.c drm_display_helper
++	drivers/gpu/drm/display/drm_hdmi_helper.c drm_display_helper
++	drivers/gpu/drm/display/drm_scdc_helper.c drm_display_helper
++	drivers/gpu/drm/drm_aperture.c drm
++	drivers/gpu/drm/drm_atomic.c drm
++	drivers/gpu/drm/drm_atomic_helper.c drm
++	drivers/gpu/drm/drm_atomic_state_helper.c drm
++	drivers/gpu/drm/drm_atomic_uapi.c drm
++	drivers/gpu/drm/drm_auth.c drm
++	drivers/gpu/drm/drm_blend.c drm
++	drivers/gpu/drm/drm_bridge.c drm
++	drivers/gpu/drm/drm_buddy.c drm
++	drivers/gpu/drm/drm_cache.c drm
++	drivers/gpu/drm/drm_client.c drm
++	drivers/gpu/drm/drm_client_modeset.c drm
++	drivers/gpu/drm/drm_color_mgmt.c drm
++	drivers/gpu/drm/drm_connector.c drm
++	drivers/gpu/drm/drm_crtc.c drm
++	drivers/gpu/drm/drm_crtc_helper.c drm
++	drivers/gpu/drm/drm_damage_helper.c drm
++	drivers/gpu/drm/drm_displayid.c drm
++	drivers/gpu/drm/drm_drv.c drm
++	drivers/gpu/drm/drm_dumb_buffers.c drm
++	drivers/gpu/drm/drm_edid.c drm
++	drivers/gpu/drm/drm_eld.c drm
++	drivers/gpu/drm/drm_encoder.c drm
++	drivers/gpu/drm/drm_encoder_slave.c drm
++	drivers/gpu/drm/drm_exec.c drm
++	drivers/gpu/drm/drm_file.c drm
++	drivers/gpu/drm/drm_flip_work.c drm
++	drivers/gpu/drm/drm_format_helper.c drm
++	drivers/gpu/drm/drm_fourcc.c drm
++	drivers/gpu/drm/drm_framebuffer.c drm
++	drivers/gpu/drm/drm_gem_atomic_helper.c drm
++	drivers/gpu/drm/drm_gem.c drm
++	drivers/gpu/drm/drm_gem_framebuffer_helper.c drm
++	drivers/gpu/drm/drm_gem_ttm_helper.c drm
++	drivers/gpu/drm/drm_ioctl.c drm
++	drivers/gpu/drm/drm_kms_helper_common.c drm
++	drivers/gpu/drm/drm_lease.c drm
++	drivers/gpu/drm/drm_managed.c drm
++	drivers/gpu/drm/drm_mm.c drm
++	drivers/gpu/drm/drm_mode_config.c drm
++	drivers/gpu/drm/drm_mode_object.c drm
++	drivers/gpu/drm/drm_modes.c drm
++	drivers/gpu/drm/drm_modeset_helper.c drm
++	drivers/gpu/drm/drm_modeset_lock.c drm
++	drivers/gpu/drm/drm_panel_orientation_quirks.c drm
++	drivers/gpu/drm/drm_pci.c drm
++	drivers/gpu/drm/drm_plane.c drm
++	drivers/gpu/drm/drm_plane_helper.c drm
++	drivers/gpu/drm/drm_prime.c drm
++	drivers/gpu/drm/drm_print.c drm
++	drivers/gpu/drm/drm_probe_helper.c drm
++	drivers/gpu/drm/drm_property.c drm
++	drivers/gpu/drm/drm_rect.c drm
++	drivers/gpu/drm/drm_self_refresh_helper.c drm
++	drivers/gpu/drm/drm_simple_kms_helper.c drm
++	drivers/gpu/drm/drm_suballoc.c drm
++	drivers/gpu/drm/drm_syncobj.c drm
++	drivers/gpu/drm/drm_sysfs.c drm
++	drivers/gpu/drm/drm_trace_points.c drm
++	drivers/gpu/drm/drm_vblank.c drm
++	drivers/gpu/drm/drm_vblank_work.c drm
++	drivers/gpu/drm/drm_vma_manager.c drm
++	drivers/gpu/drm/drm_writeback.c drm
++	drivers/gpu/drm/scheduler/sched_entity.c gpu_sched
++	drivers/gpu/drm/scheduler/sched_fence.c gpu_sched
++	drivers/gpu/drm/scheduler/sched_main.c gpu_sched
++	drivers/gpu/drm/ttm/ttm_bo.c ttm
++	drivers/gpu/drm/ttm/ttm_bo_util.c ttm
++	drivers/gpu/drm/ttm/ttm_bo_vm.c ttm
++	drivers/gpu/drm/ttm/ttm_device.c ttm
++	drivers/gpu/drm/ttm/ttm_execbuf_util.c ttm
++	drivers/gpu/drm/ttm/ttm_module.c ttm
++	drivers/gpu/drm/ttm/ttm_pool.c ttm
++	drivers/gpu/drm/ttm/ttm_range_manager.c ttm
++	drivers/gpu/drm/ttm/ttm_resource.c ttm
++	drivers/gpu/drm/ttm/ttm_sys_manager.c ttm
++	drivers/gpu/drm/ttm/ttm_tt.c ttm
++	drivers/i2c/algos/i2c-algo-bit.c linuxkpi_lib
++	drivers/video/hdmi.c linuxkpi_lib
++	lib/bitmap.c linuxkpi_lib
++	lib/idr.c linuxkpi_lib
++	lib/radix-tree.c linuxkpi_lib
++	lib/rbtree.c linuxkpi_lib
++	lib/xarray.c linuxkpi_lib
++	;
+diff --git a/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp b/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp
+new file mode 100644
+index 0000000000..1b698d909a
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp
+@@ -0,0 +1,569 @@
++/*
++ * Copyright 2026, hans2294.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*!	Haiku driver glue for Linux's amdgpu: brings up linuxkpi, runs the Linux
++	modules' init calls (DRM, TTM, ..., amdgpu), which probe the GPUs, and
++	publishes the character devices they add (/dev/dri/card0,
++	/dev/dri/renderD128), a graphics node for app_server, and a status node.
++
++	The graphics node, /dev/graphics/amdgpu_kms_0, is the DRM primary node
++	under another name: it names amdgpu_kms.accelerant, which sets modes and
++	gets its frame buffer through Linux's KMS on it.
++
++	The file node, /dev/misc/linuxkpi/file, carries Linux files that are no
++	device node, like the dma-bufs PRIME hands out: Linux's fds for them are
++	Haiku fds of the calling team that the driver opens on that node (see
++	linuxkpi_fd_reserve() and its friends).
++
++	Only GPUs on the device list are probed: Navi 31 (1002:744c), the one
++	this port was brought up on, unless the driver settings file "amdgpu"
++	says otherwise ("devices 744c 164e", PCI device IDs of AMD GPUs, or
++	"devices all"). A machine's other AMD GPUs (an integrated one, say) stay
++	untouched that way.
++
++	The status node is in /dev/misc so app_server leaves it alone; it also
++	keeps the driver loaded when probing failed, as devfs unloads drivers
++	that publish nothing. The DRM nodes go straight to Linux's file
++	operations: open (on first use), flush on close, release on free,
++	ioctl, read; linuxkpi's own ioctls (uapi.h) stand in for mmap() and
++	sysfs.
++*/
++
++
++#include <Drivers.h>
++#include <driver_settings.h>
++#include <KernelExport.h>
++#include <graphic_driver.h>
++#include <PCI.h>
++#include <kernel.h>
++#include <ksystem_info.h>
++#include <fs/fd.h>
++#include <lock.h>
++#include <util/AutoLock.h>
++#include <vfs.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "../../../../../libs/compat/linuxkpi/include/linuxkpi/chrdev.h"
++#include "../../../../../libs/compat/linuxkpi/include/linuxkpi/haiku.h"
++#include "../../../../../libs/compat/linuxkpi/include/linuxkpi/uapi.h"
++
++
++#define TRACE(x...)		dprintf("amdgpu: " x)
++
++
++int32 api_version = B_CUR_DRIVER_API_VERSION;
++
++extern "C" int linuxkpi_run_initcalls(void);
++extern "C" void linuxkpi_run_exitcalls(void);
++
++static const char* kStatusDevice = "misc/amdgpu/0";
++static const char* kFileDevice = "misc/linuxkpi/file";
++static const char* kFileDevicePath = "/dev/misc/linuxkpi/file";
++static const char* kGraphicsDevice = "graphics/amdgpu_kms_0";
++static const char* kGraphicsDRMNode = "dri/card0";
++static const char* kAccelerant = "amdgpu_kms.accelerant";
++static const int kMaxDevices = 16;
++
++static const char* sDeviceNames[kMaxDevices + 1];
++
++static const uint32 kAmdVendor = 0x1002;
++static const uint32 kDefaultDevices[] = { 0x744c };	// Navi 31
++static const int kMaxListedDevices = 16;
++static uint32 sAllowedDevices[kMaxListedDevices];	// vendor << 16 | device
++static int sAllowedDeviceCount = -1;				// all of them
++
++static mutex sFileVnodeLock = MUTEX_INITIALIZER("linuxkpi file vnode");
++static struct vnode* sFileVnode;
++	// referenced while the driver is loaded, to recognize the file node's fds
++static int sInitResult;
++
++
++/*!	The device list from the settings file, or the default one. */
++static void
++read_device_list()
++{
++	sAllowedDeviceCount = 0;
++	void* handle = load_driver_settings("amdgpu");
++	const driver_settings* settings = get_driver_settings(handle);
++	const driver_parameter* devices = NULL;
++	for (int i = 0; settings != NULL && i < settings->parameter_count; i++) {
++		if (strcmp(settings->parameters[i].name, "devices") == 0)
++			devices = &settings->parameters[i];
++	}
++	if (devices != NULL) {
++		for (int i = 0; i < devices->value_count
++				&& sAllowedDeviceCount < kMaxListedDevices; i++) {
++			if (strcmp(devices->values[i], "all") == 0) {
++				sAllowedDeviceCount = -1;
++				break;
++			}
++			sAllowedDevices[sAllowedDeviceCount++] = kAmdVendor << 16
++				| strtoul(devices->values[i], NULL, 16);
++		}
++	} else {
++		for (size_t i = 0; i < B_COUNT_OF(kDefaultDevices); i++)
++			sAllowedDevices[sAllowedDeviceCount++] = kAmdVendor << 16
++				| kDefaultDevices[i];
++	}
++	unload_driver_settings(handle);
++}
++
++
++/*!	This driver reaches into the kernel's private parts, and panics on a kernel
++	from before these changes, where nothing can catch it: the kernel's lock ABI
++	(hrev60013), and fork() with shared device areas (hrev60102). Keep away,
++	and the desktop falls back on the frame buffer.
++*/
++static bool
++kernel_is_recent_enough()
++{
++	static const unsigned long kOldestRevision = 60102;
++	const char* revision = get_haiku_revision();
++	if (strncmp(revision, "hrev", 4) == 0
++		&& strtoul(revision + 4, NULL, 10) >= kOldestRevision) {
++		return true;
++	}
++	dprintf("amdgpu: not loading: needs hrev%lu or newer, this is %s\n",
++		kOldestRevision, revision);
++	return false;
++}
++
++
++static bool
++device_allowed(const pci_info& info)
++{
++	if (sAllowedDeviceCount < 0)
++		return true;
++	for (int i = 0; i < sAllowedDeviceCount; i++) {
++		if (sAllowedDevices[i] == ((uint32)info.vendor_id << 16 | info.device_id))
++			return true;
++	}
++	return false;
++}
++
++
++extern "C" status_t
++init_hardware(void)
++{
++	if (!kernel_is_recent_enough())
++		return ENODEV;
++
++	pci_module_info* pci;
++	if (get_module(B_PCI_MODULE_NAME, (module_info**)&pci) != B_OK)
++		return B_ERROR;
++
++	read_device_list();
++	status_t status = ENODEV;
++	pci_info info;
++	for (int32 i = 0; pci->get_nth_pci_info(i, &info) == B_OK; i++) {
++		if (info.vendor_id == kAmdVendor && info.class_base == PCI_display) {
++			if (device_allowed(info)) {
++				status = B_OK;
++				break;
++			}
++		}
++	}
++	put_module(B_PCI_MODULE_NAME);
++	return status;
++}
++
++
++extern "C" status_t
++init_driver(void)
++{
++	read_device_list();
++	if (sAllowedDeviceCount >= 0) {
++		linuxkpi_pci_set_allowed_devices(sAllowedDevices, sAllowedDeviceCount);
++		TRACE("probing %d listed device(s), the first %04" B_PRIx32 "\n",
++			sAllowedDeviceCount, sAllowedDevices[0] & 0xffff);
++	}
++	TRACE("running the Linux init calls\n");
++	sInitResult = linuxkpi_run_initcalls();
++	TRACE("Linux init calls returned %d\n", sInitResult);
++	return B_OK;
++}
++
++
++extern "C" void
++uninit_driver(void)
++{
++	TRACE("running the Linux exit calls\n");
++	linuxkpi_run_exitcalls();
++	lkpi_haiku_shutdown();
++	if (sFileVnode != NULL)
++		vfs_put_vnode(sFileVnode);
++}
++
++
++extern "C" const char**
++publish_devices(void)
++{
++	int count = 0;
++	sDeviceNames[count++] = kStatusDevice;
++	sDeviceNames[count++] = kFileDevice;
++	for (int i = 0; count < kMaxDevices - 1; i++) {
++		const char* path = linuxkpi_chrdev_path(i);
++		if (path == NULL)
++			break;
++		sDeviceNames[count++] = path;
++		if (strcmp(path, kGraphicsDRMNode) == 0)
++			sDeviceNames[count++] = kGraphicsDevice;
++	}
++	sDeviceNames[count] = NULL;
++	return sDeviceNames;
++}
++
++
++//	#pragma mark - device hooks
++
++
++/*!	The cookie of an open device. The Linux file is opened on first use,
++	so asking a node which device it is (LINUXKPI_IOCTL_DEVICE_INFO) costs
++	no DRM file and GPU VM.
++*/
++struct open_device {
++	char path[B_PATH_NAME_LENGTH];	/* of the Linux node */
++	int linux_flags;
++	bool status;			/* the status node */
++	bool graphics;			/* the graphics node */
++	bool linux_file;		/* the file node */
++	void* file;				/* NULL until opened (or installed) */
++};
++
++
++static status_t
++amdgpu_open(const char* name, uint32 flags, void** _cookie)
++{
++	open_device* device = (open_device*)calloc(1, sizeof(open_device));
++	if (device == NULL)
++		return B_NO_MEMORY;
++	device->status = strcmp(name, kStatusDevice) == 0;
++	device->graphics = strcmp(name, kGraphicsDevice) == 0;
++	device->linux_file = strcmp(name, kFileDevice) == 0;
++	strlcpy(device->path, device->graphics ? kGraphicsDRMNode : name,
++		sizeof(device->path));
++	device->linux_flags = flags & O_ACCMODE;
++	if ((flags & O_NONBLOCK) != 0)
++		device->linux_flags |= LINUXKPI_O_NONBLOCK;
++
++	if (!device->status && !device->linux_file) {
++		linuxkpi_device_info info;
++		int error = linuxkpi_chrdev_device_info(device->path, &info);
++		if (error != 0) {
++			free(device);
++			return lkpi_haiku_error(error);
++		}
++	}
++
++	*_cookie = device;
++	return B_OK;
++}
++
++
++static status_t
++open_linux_file(open_device* device)
++{
++	if (device->file != NULL)
++		return B_OK;
++	if (device->linux_file)
++		return B_FILE_ERROR;
++	return lkpi_haiku_error(linuxkpi_chrdev_open(device->path,
++		device->linux_flags, &device->file));
++}
++
++
++static status_t
++amdgpu_close(void* cookie)
++{
++	open_device* device = (open_device*)cookie;
++	if (device->file != NULL)
++		linuxkpi_chrdev_close(device->file);
++	return B_OK;
++}
++
++
++static status_t
++amdgpu_free(void* cookie)
++{
++	open_device* device = (open_device*)cookie;
++	if (device->linux_file) {
++		if (device->file != NULL)
++			linuxkpi_file_put(device->file);
++	} else if (device->file != NULL)
++		linuxkpi_chrdev_free(device->file);
++	free(device);
++	return B_OK;
++}
++
++
++static status_t
++status_read(off_t position, void* buffer, size_t* _length)
++{
++	char status[64];
++	int length = snprintf(status, sizeof(status),
++		"Linux amdgpu on linuxkpi; init calls returned %d\n", sInitResult);
++	if (position >= length) {
++		*_length = 0;
++		return B_OK;
++	}
++	size_t bytes = min_c(*_length, (size_t)(length - position));
++	if (user_memcpy(buffer, status + position, bytes) != B_OK)
++		return B_BAD_ADDRESS;
++	*_length = bytes;
++	return B_OK;
++}
++
++
++static status_t
++amdgpu_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	open_device* device = (open_device*)cookie;
++	if (device->status)
++		return status_read(position, buffer, _length);
++	status_t status = open_linux_file(device);
++	if (status != B_OK)
++		return status;
++
++	long long linuxPosition = position;
++	long result = linuxkpi_chrdev_read(device->file, buffer, *_length,
++		&linuxPosition);
++	if (result < 0) {
++		*_length = 0;
++		return lkpi_haiku_error(result);
++	}
++	*_length = result;
++	return B_OK;
++}
++
++
++static status_t
++amdgpu_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	*_length = 0;
++	return B_NOT_ALLOWED;
++}
++
++
++static status_t
++map_into_team(open_device* device, void* buffer)
++{
++	linuxkpi_mmap request;
++	if (!IS_USER_ADDRESS(buffer)
++		|| user_memcpy(&request, buffer, sizeof(request)) != B_OK)
++		return B_BAD_ADDRESS;
++
++	void* address;
++	int area = linuxkpi_chrdev_mmap(device->file, request.offset, request.size,
++		(request.flags & LINUXKPI_MMAP_WRITE) != 0, &address);
++	if (area < 0)
++		return lkpi_haiku_error(area);
++
++	request.area = area;
++	request.address = (addr_t)address;
++	if (user_memcpy(buffer, &request, sizeof(request)) != B_OK) {
++		linuxkpi_chrdev_munmap(address);
++		return B_BAD_ADDRESS;
++	}
++	return B_OK;
++}
++
++
++static status_t
++device_info(open_device* device, void* buffer)
++{
++	linuxkpi_device_info info;
++	int error = linuxkpi_chrdev_device_info(device->path, &info);
++	if (error != 0)
++		return lkpi_haiku_error(error);
++	if (!IS_USER_ADDRESS(buffer)
++		|| user_memcpy(buffer, &info, sizeof(info)) != B_OK)
++		return B_BAD_ADDRESS;
++	return B_OK;
++}
++
++
++static status_t
++unmap_from_team(void* buffer)
++{
++	linuxkpi_munmap request;
++	if (!IS_USER_ADDRESS(buffer)
++		|| user_memcpy(&request, buffer, sizeof(request)) != B_OK)
++		return B_BAD_ADDRESS;
++	return lkpi_haiku_error(linuxkpi_chrdev_munmap((void*)(addr_t)
++		request.address));
++}
++
++
++static status_t
++file_size(open_device* device, void* buffer)
++{
++	if (!device->linux_file || device->file == NULL)
++		return B_FILE_ERROR;
++	struct linuxkpi_file_size request;
++	request.size = linuxkpi_file_size(device->file);
++	if (!IS_USER_ADDRESS(buffer)
++		|| user_memcpy(buffer, &request, sizeof(request)) != B_OK)
++		return B_BAD_ADDRESS;
++	return B_OK;
++}
++
++
++/*!	Linux ioctl commands come through unchanged as \a op, encoded the Linux
++	way (direction, size, type, number); \a buffer is the user's argument.
++	linuxkpi's own commands (uapi.h) stand in for mmap().
++*/
++static status_t
++amdgpu_control(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	open_device* device = (open_device*)cookie;
++	if (device->status)
++		return B_DEV_INVALID_IOCTL;
++
++	if (device->graphics && op == B_GET_ACCELERANT_SIGNATURE) {
++		if (!IS_USER_ADDRESS(buffer)
++			|| user_strlcpy((char*)buffer, kAccelerant, B_OS_NAME_LENGTH) < B_OK)
++			return B_BAD_ADDRESS;
++		return B_OK;
++	}
++
++	// These two need no Linux file: unmapping may go through any node.
++	if (op == LINUXKPI_IOCTL_DEVICE_INFO)
++		return device_info(device, buffer);
++	if (op == LINUXKPI_IOCTL_MUNMAP)
++		return unmap_from_team(buffer);
++	if (op == LINUXKPI_IOCTL_FILE_SIZE)
++		return file_size(device, buffer);
++
++	status_t status = open_linux_file(device);
++	if (status != B_OK)
++		return status;
++	if (op == LINUXKPI_IOCTL_MMAP)
++		return map_into_team(device, buffer);
++
++	long result = linuxkpi_chrdev_ioctl(device->file, op, buffer);
++	if (result < 0)
++		return lkpi_haiku_error(result);
++	return B_OK;
++}
++
++
++//	#pragma mark - Linux fds
++
++
++/*	What devfs keeps as a file descriptor's cookie (devfs.cpp): the
++	device's cookie comes first. */
++struct devfs_cookie_head {
++	void* device_cookie;
++};
++
++// Linux's errno values, which linuxkpi_fd_reserve() returns negated
++static const int kLinuxENODEV = 19;
++static const int kLinuxEMFILE = 24;
++
++
++
++/*!	The file node's cookie behind \a fd of the current team; the
++	descriptor stays referenced (put_fd()) while the cookie is used.
++*/
++static open_device*
++file_device_for_fd(int fd, file_descriptor** _descriptor)
++{
++	if (sFileVnode == NULL)
++		return NULL;
++	file_descriptor* descriptor = get_fd(get_current_io_context(false), fd);
++	if (descriptor == NULL)
++		return NULL;
++	if (descriptor->u.vnode != sFileVnode || descriptor->cookie == NULL) {
++		put_fd(descriptor);
++		return NULL;
++	}
++	*_descriptor = descriptor;
++	return (open_device*)((devfs_cookie_head*)descriptor->cookie)
++		->device_cookie;
++}
++
++
++extern "C" int
++linuxkpi_fd_reserve(int closeOnExec)
++{
++	MutexLocker _(sFileVnodeLock);
++	if (sFileVnode == NULL
++		&& vfs_get_vnode_from_path(kFileDevicePath, true, &sFileVnode) != B_OK) {
++		sFileVnode = NULL;
++		return -kLinuxENODEV;
++	}
++
++	// the new fd takes this reference over
++	struct vnode* vnode;
++	if (vfs_get_vnode_from_path(kFileDevicePath, true, &vnode) != B_OK)
++		return -kLinuxENODEV;
++	int fd = vfs_open_vnode(vnode, O_RDWR | (closeOnExec ? O_CLOEXEC : 0),
++		false);
++	if (fd < 0) {
++		vfs_put_vnode(vnode);
++		return -kLinuxEMFILE;
++	}
++	return fd;
++}
++
++
++extern "C" void
++linuxkpi_fd_install(int fd, void* file)
++{
++	file_descriptor* descriptor;
++	open_device* device = file_device_for_fd(fd, &descriptor);
++	if (device != NULL && device->file == NULL) {
++		device->file = file;
++		file = NULL;
++	}
++	if (device != NULL)
++		put_fd(descriptor);
++	if (file != NULL) {
++		// the fd went away (or was no file node) meanwhile
++		linuxkpi_file_put(file);
++	}
++}
++
++
++extern "C" void
++linuxkpi_fd_release(int fd)
++{
++	_user_close(fd);
++}
++
++
++extern "C" void*
++linuxkpi_fd_get(int fd)
++{
++	file_descriptor* descriptor;
++	open_device* device = file_device_for_fd(fd, &descriptor);
++	if (device == NULL)
++		return NULL;
++	void* file = device->file != NULL ? linuxkpi_file_get(device->file) : NULL;
++	put_fd(descriptor);
++	return file;
++}
++
++
++static device_hooks sHooks = {
++	amdgpu_open,
++	amdgpu_close,
++	amdgpu_free,
++	amdgpu_control,
++	amdgpu_read,
++	amdgpu_write,
++};
++
++
++extern "C" device_hooks*
++find_device(const char* name)
++{
++	return &sHooks;
++}

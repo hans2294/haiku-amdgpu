@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 02:24:20 +0100
+Subject: [PATCH] Haiku: RADV on Linux's amdgpu through linuxkpi
+
+Haiku has DRM now (Linux's drivers on linuxkpi), so it joins the systems
+with KMS/DRM and gets libdrm. What else RADV needs there:
+
+- simple_mtx on libroot's user mutex: Haiku has no futex, and its pthread
+  mutexes are not valid when zeroed, which simple_mtx users rely on.
+- Buffer mappings through libdrm's drmMap()/drmUnmap(), which use
+  linuxkpi's mmap ioctl; Haiku has no mmap() for devices. Placed
+  mappings are not supported yet.
+- The DRM nodes' dev_t from their names, in libdrm's Haiku encoding, as
+  Haiku's stat() does not know them.
+- ioctl() is declared in Haiku's unistd.h.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ meson.build                                   |  2 +-
+ src/amd/vulkan/radv_physical_device.c         | 25 +++++++++
+ src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c | 20 +++++++
+ src/util/os_drm.h                             |  3 ++
+ src/util/simple_mtx.c                         |  4 +-
+ src/util/simple_mtx.h                         | 53 +++++++++++++++++++
+ 6 files changed, 104 insertions(+), 3 deletions(-)
+
+diff --git a/meson.build b/meson.build
+index 37f2fd4..3b8084b 100644
+--- a/meson.build
++++ b/meson.build
+@@ -159,7 +159,7 @@ pre_args += '-DHAVE_OPENGL_ES_2=@0@'.format(with_gles2.to_int())
+ 
+ with_any_opengl = with_opengl or with_gles1 or with_gles2
+ 
+-system_has_kms_drm = ['openbsd', 'netbsd', 'freebsd', 'gnu/kfreebsd', 'dragonfly', 'linux', 'sunos', 'android', 'managarm'].contains(host_machine.system())
++system_has_kms_drm = ['openbsd', 'netbsd', 'freebsd', 'gnu/kfreebsd', 'dragonfly', 'linux', 'sunos', 'android', 'managarm', 'haiku'].contains(host_machine.system())
+ 
+ gallium_drivers = get_option('gallium-drivers')
+ if gallium_drivers.contains('auto')
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index a59b99e..090417c 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -17,6 +17,31 @@
+ #include <sys/sysmacros.h>
+ #endif
+ 
++#ifdef __HAIKU__
++/* Haiku's DRM nodes are linuxkpi devices, and Haiku's stat() knows nothing
++ * of their Linux dev_t. libdrm on Haiku encodes it like this, so derive it
++ * from the node's name for drmGetDeviceFromDevId() to find it again. */
++#include <stdio.h>
++#define major(dev) ((unsigned int)((dev) >> 20) & 0xfff)
++#define minor(dev) ((unsigned int)(dev) & 0xfffff)
++
++static int
++radv_haiku_node_stat(const char *path, struct stat *st)
++{
++   const char *name = strrchr(path, '/');
++   unsigned int node_minor;
++
++   if (stat(path, st) != 0)
++      return -1;
++   name = name ? name + 1 : path;
++   if (sscanf(name, "card%u", &node_minor) != 1 && sscanf(name, "renderD%u", &node_minor) != 1)
++      return -1;
++   st->st_rdev = (dev_t)((226 << 20) | node_minor);
++   return 0;
++}
++#define stat(path, st) radv_haiku_node_stat(path, st)
++#endif
++
+ #include "vk_drm_syncobj.h"
+ #include "vk_log.h"
+ #include "vk_shader_module.h"
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+index a4cf133..aa49de7 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+@@ -378,7 +378,11 @@ radv_amdgpu_winsys_bo_destroy(struct radeon_winsys *_ws, struct radeon_winsys_bo
+    }
+ 
+    if (bo->cpu_map)
++#ifdef __HAIKU__
++      drmUnmap(bo->cpu_map, bo->base.size);
++#else
+       munmap(bo->cpu_map, bo->base.size);
++#endif
+ 
+    if (ws->debug_all_bos)
+       radv_amdgpu_global_bo_list_del(ws, bo);
+@@ -748,10 +752,20 @@ radv_amdgpu_winsys_bo_map(struct radeon_winsys *_ws, struct radeon_winsys_bo *_b
+    if (ret)
+       return NULL;
+ 
++#ifdef __HAIKU__
++   /* Haiku has no mmap() for devices; libdrm maps through linuxkpi's ioctl,
++    * wherever it likes.
++    * TODO: fixed addresses (VK_EXT_map_memory_placed) */
++   void *data;
++   if (use_fixed_addr ||
++       drmMap(radv_amdgpu_winsys(_ws)->fd, args.out.addr_ptr, bo->base.size, &data) != 0)
++      return NULL;
++#else
+    void *data = mmap(fixed_addr, bo->base.size, PROT_READ | PROT_WRITE, MAP_SHARED | (use_fixed_addr ? MAP_FIXED : 0),
+                      radv_amdgpu_winsys(_ws)->fd, args.out.addr_ptr);
+    if (data == MAP_FAILED)
+       return NULL;
++#endif
+ 
+    bo->cpu_map = data;
+    return data;
+@@ -767,6 +781,11 @@ radv_amdgpu_winsys_bo_unmap(struct radeon_winsys *_ws, struct radeon_winsys_bo *
+       return;
+ 
+    assert(bo->cpu_map);
++#ifdef __HAIKU__
++   /* Without placed mappings there is no address range to keep. */
++   (void)replace;
++   drmUnmap(bo->cpu_map, bo->base.size);
++#else
+    if (replace) {
+       (void)mmap(bo->cpu_map, bo->base.size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    } else {
+@@ -778,6 +797,7 @@ radv_amdgpu_winsys_bo_unmap(struct radeon_winsys *_ws, struct radeon_winsys_bo *
+ #endif
+          munmap(bo->cpu_map, bo->base.size);
+    }
++#endif
+    bo->cpu_map = NULL;
+ }
+ 
+diff --git a/src/util/os_drm.h b/src/util/os_drm.h
+index 0390ecd..d716503 100644
+--- a/src/util/os_drm.h
++++ b/src/util/os_drm.h
+@@ -15,6 +15,9 @@
+ #endif
+ 
+ #include <sys/ioctl.h>
++#ifdef __HAIKU__
++#include <unistd.h>	/* Haiku declares ioctl() here */
++#endif
+ #include <errno.h>
+ #include <xf86drm.h>
+ 
+diff --git a/src/util/simple_mtx.c b/src/util/simple_mtx.c
+index 8b53e10..965ac6e 100644
+--- a/src/util/simple_mtx.c
++++ b/src/util/simple_mtx.c
+@@ -6,7 +6,7 @@
+ 
+ #include "simple_mtx.h"
+ 
+-#if !UTIL_FUTEX_SUPPORTED
++#if !UTIL_FUTEX_SUPPORTED && !defined(__HAIKU__)
+ 
+ void _simple_mtx_plain_init_once(simple_mtx_t *mtx)
+ {
+@@ -30,4 +30,4 @@ simple_mtx_destroy(simple_mtx_t *mtx)
+    }
+ }
+ 
+-#endif /* !UTIL_FUTEX_SUPPORTED */
++#endif /* !UTIL_FUTEX_SUPPORTED && !__HAIKU__ */
+diff --git a/src/util/simple_mtx.h b/src/util/simple_mtx.h
+index 4152bb6..cf970e6 100644
+--- a/src/util/simple_mtx.h
++++ b/src/util/simple_mtx.h
+@@ -145,6 +145,59 @@ simple_mtx_assert_locked(ASSERTED simple_mtx_t *mtx)
+    assert(mtx->val);
+ }
+ 
++#elif defined(__HAIKU__)
++
++/* Haiku has no futex, and its pthread mutexes are not valid when zeroed,
++ * which Mesa relies on for simple_mtx (as with futexes, a zeroed one is
++ * unlocked). libroot's own lightweight mutex is: it sits on the kernel's
++ * user mutex syscalls like a futex lock. Same layout as libroot's struct
++ * mutex (private/shared/locks.h).
++ */
++typedef struct {
++   const char *name;
++   int32_t lock;
++   uint32_t flags;
++} simple_mtx_t;
++
++#define SIMPLE_MTX_INITIALIZER { NULL, 0, 0 }
++
++int32_t __mutex_lock(simple_mtx_t *mtx);
++void __mutex_unlock(simple_mtx_t *mtx);
++
++static inline void
++simple_mtx_init(simple_mtx_t *mtx, ASSERTED int type)
++{
++   assert(type == mtx_plain);
++   mtx->name = NULL;
++   mtx->lock = 0;
++   mtx->flags = 0;
++}
++
++static inline void
++simple_mtx_destroy(ASSERTED simple_mtx_t *mtx)
++{
++}
++
++static inline void
++simple_mtx_lock(simple_mtx_t *mtx)
++{
++   /* only fails when interrupted */
++   while (__mutex_lock(mtx) != 0)
++      ;
++}
++
++static inline void
++simple_mtx_unlock(simple_mtx_t *mtx)
++{
++   __mutex_unlock(mtx);
++}
++
++static inline void
++simple_mtx_assert_locked(ASSERTED simple_mtx_t *mtx)
++{
++   assert(mtx->lock & 1);
++}
++
+ #else /* !UTIL_FUTEX_SUPPORTED */
+ 
+ typedef struct simple_mtx_t {

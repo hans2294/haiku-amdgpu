@@ -1,0 +1,37 @@
+name			mesa_radeon
+version			26.2.6-1
+architecture	x86_64
+summary			"Mesa with radeonsi and RADV for Linux's amdgpu on linuxkpi"
+description		"Mesa 26 built for Haiku with the radeonsi OpenGL driver (ACO, \
+no LLVM), EGL and GLES, the RADV Vulkan driver with Haiku window surfaces \
+(vulkan_haiku.h), and a libGL with Haiku's BGLView on top, which takes the \
+place of the system Mesa: BGLView programs render on the card, in direct \
+mode straight into the frame buffer."
+packager		"hans2294 <22217531+hans2294@users.noreply.github.com>"
+vendor			"hans2294"
+copyrights		{ "1999-2026 the Mesa authors" }
+licenses		{ "MIT" }
+provides {
+	mesa_radeon = 26.2.6
+	lib:libGL = 1.0.0 compat >= 1
+	lib:libEGL = 1.0.0 compat >= 1
+	lib:libGLESv2 = 2.0.0 compat >= 2
+	lib:libgallium_26.2.6 = 26.2.6
+	lib:libvulkan_radeon = 26.2.6
+}
+requires {
+	haiku
+	lib:libdrm >= 2.4.134
+	lib:libdrm_amdgpu >= 2.4.134
+	lib:libstdc++
+}
+conflicts {
+	mesa
+	mesa_devel
+	mesa_swpipe
+}
+replaces {
+	mesa
+	mesa_devel
+	mesa_swpipe
+}

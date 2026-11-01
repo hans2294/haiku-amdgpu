@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:38:23 +0100
+Subject: [PATCH] libdrm: Build it from ../libdrm
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/libs/Jamfile        |  1 +
+ src/libs/libdrm/Jamfile | 44 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 45 insertions(+)
+ create mode 100644 src/libs/libdrm/Jamfile
+
+diff --git a/src/libs/Jamfile b/src/libs/Jamfile
+index b8baae51cc..5a0ba4cd29 100644
+--- a/src/libs/Jamfile
++++ b/src/libs/Jamfile
+@@ -5,6 +5,7 @@ SubInclude HAIKU_TOP src libs alm ;
+ SubInclude HAIKU_TOP src libs bsd ;
+ SubInclude HAIKU_TOP src libs compat ;
+ SubInclude HAIKU_TOP src libs glut ;
++SubInclude HAIKU_TOP src libs libdrm ;
+ SubInclude HAIKU_TOP src libs gnu ;
+ SubInclude HAIKU_TOP src libs icon ;
+ SubInclude HAIKU_TOP src libs iconv ;
+diff --git a/src/libs/libdrm/Jamfile b/src/libs/libdrm/Jamfile
+new file mode 100644
+index 0000000000..445dc61c82
+--- /dev/null
++++ b/src/libs/libdrm/Jamfile
+@@ -0,0 +1,44 @@
++SubDir HAIKU_TOP src libs libdrm ;
++
++# libdrm and libdrm_amdgpu from the libdrm tree next to Haiku's (branch
++# "haiku"), for Linux's DRM drivers on linuxkpi. The Haiku parts are in its
++# haiku/ directory: config.h, Linux's ioctl encoding, the linuxkpi glue.
++
++LIBDRM_TOP = [ FDirName $(HAIKU_TOP) .. libdrm ] ;
++local haikuDir = [ FDirName $(LIBDRM_TOP) haiku ] ;
++
++SubDirSysHdrs $(haikuDir) ;
++SubDirSysHdrs $(LIBDRM_TOP) ;
++SubDirSysHdrs [ FDirName $(LIBDRM_TOP) include drm ] ;
++# for <linuxkpi/uapi.h>
++SubDirSysHdrs [ FDirName $(HAIKU_TOP) src libs compat linuxkpi include ] ;
++
++SubDirCcFlags -include [ FDirName $(haikuDir) config.h ]
++	-DAMDGPU_ASIC_ID_TABLE=\\\"/boot/system/data/libdrm/amdgpu.ids\\\"
++	-Wno-unused-parameter -Wno-missing-field-initializers -Wno-sign-compare ;
++
++SEARCH_SOURCE += $(LIBDRM_TOP) [ FDirName $(LIBDRM_TOP) amdgpu ] $(haikuDir) ;
++
++SharedLibrary libdrm.so :
++	xf86drm.c
++	xf86drmHash.c
++	xf86drmRandom.c
++	xf86drmSL.c
++	xf86drmMode.c
++	libdrm_haiku.c
++	: [ MultiArchDefaultGristFiles libposix_error_mapper.a ] root
++	;
++
++SharedLibrary libdrm_amdgpu.so :
++	amdgpu_asic_id.c
++	amdgpu_bo.c
++	amdgpu_cs.c
++	amdgpu_device.c
++	amdgpu_gpu_info.c
++	amdgpu_vamgr.c
++	amdgpu_vm.c
++	amdgpu_userq.c
++	handle_table.c
++	libdrm_haiku.c
++	: [ MultiArchDefaultGristFiles libposix_error_mapper.a ] libdrm.so root
++	;

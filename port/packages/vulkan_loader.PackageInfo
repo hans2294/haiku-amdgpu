@@ -1,0 +1,17 @@
+name			vulkan_loader
+version			1.4.367-100
+architecture	x86_64
+summary			"Khronos' Vulkan loader"
+description		"The Khronos Vulkan ICD loader (libvulkan.so.1), built for Haiku: \
+it finds drivers through their JSON manifests in data/vulkan/icd.d."
+packager		"hans2294 <22217531+hans2294@users.noreply.github.com>"
+vendor			"hans2294"
+copyrights		{ "2014-2026 The Khronos Group Inc., Valve Corporation, LunarG, Inc." }
+licenses		{ "Apache v2" }
+provides {
+	vulkan_loader = 1.4.367
+	lib:libvulkan = 1.4.367 compat >= 1
+}
+requires {
+	haiku
+}

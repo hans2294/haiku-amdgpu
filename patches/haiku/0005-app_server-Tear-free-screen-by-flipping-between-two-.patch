@@ -1,0 +1,352 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:38:23 +0100
+Subject: [PATCH] app_server: Tear-free screen by flipping between two screens
+
+Needs the accelerant's page flip feature; without it, as before. TEAR_FREE=0
+in the environment turns it off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/servers/app/drawing/HWInterface.h         |   2 +-
+ .../interface/local/AccelerantHWInterface.cpp | 210 +++++++++++++++++-
+ .../interface/local/AccelerantHWInterface.h   |  28 +++
+ 3 files changed, 237 insertions(+), 3 deletions(-)
+
+diff --git a/src/servers/app/drawing/HWInterface.h b/src/servers/app/drawing/HWInterface.h
+index 65992d56ed..adaab52490 100644
+--- a/src/servers/app/drawing/HWInterface.h
++++ b/src/servers/app/drawing/HWInterface.h
+@@ -178,7 +178,7 @@ protected:
+ 	virtual	void				_DrawCursor(IntRect area) const;
+ 
+ 	// does the actual transfer and handles color space conversion
+-			void				_CopyToFront(uint8* src, uint32 srcBPR, int32 x,
++	virtual	void				_CopyToFront(uint8* src, uint32 srcBPR, int32 x,
+ 									int32 y, int32 right, int32 bottom) const;
+ 
+ 			IntRect				_CursorFrame() const;
+diff --git a/src/servers/app/drawing/interface/local/AccelerantHWInterface.cpp b/src/servers/app/drawing/interface/local/AccelerantHWInterface.cpp
+index 6b122d67ef..1df6f5d0c4 100644
+--- a/src/servers/app/drawing/interface/local/AccelerantHWInterface.cpp
++++ b/src/servers/app/drawing/interface/local/AccelerantHWInterface.cpp
+@@ -33,6 +33,7 @@
+ #include <unistd.h>
+ 
+ #include <Accelerant.h>
++#include <Autolock.h>
+ #include <Cursor.h>
+ #include <Directory.h>
+ #include <FindDirectory.h>
+@@ -47,6 +48,8 @@
+ #include "RGBColor.h"
+ #include "ServerConfig.h"
+ #include "ServerCursor.h"
++
++#include <page_flip.h>
+ #include "ServerProtocol.h"
+ #include "SystemPalette.h"
+ 
+@@ -149,6 +152,16 @@ AccelerantHWInterface::AccelerantHWInterface()
+ 
+ 	fInitialModeSwitch(true),
+ 
++	fAccMoveDisplay(NULL),
++	fFlipping(false),
++	fFlipGeneration(0),
++	fHiddenHalf(1),
++	fFlipThread(-1),
++	fFlipSemaphore(-1),
++	fFlipQuit(false),
++	fFlipLock("page flip"),
++	fDamageLock("page flip damage"),
++
+ 	fRetraceSemaphore(-1),
+ 
+ 	fRectParams(new (nothrow) fill_rect_params[kDefaultParamsCount]),
+@@ -397,6 +410,12 @@ AccelerantHWInterface::_SetupDefaultHooks()
+ 	fAccSetCursorBitmap
+ 		= (set_cursor_bitmap)fAccelerantHook(B_SET_CURSOR_BITMAP, NULL);
+ 	fAccMoveCursor = (move_cursor)fAccelerantHook(B_MOVE_CURSOR, NULL);
++
++	// page flipping, from accelerants that promise vsynced flips
++	if (fAccelerantHook(B_ACCELERANT_PAGE_FLIP_FEATURE, NULL) != NULL) {
++		fAccMoveDisplay
++			= (move_display_area)fAccelerantHook(B_MOVE_DISPLAY, NULL);
++	}
+ 	fAccShowCursor = (show_cursor)fAccelerantHook(B_SHOW_CURSOR, NULL);
+ 
+ 	// dpms
+@@ -440,6 +459,18 @@ AccelerantHWInterface::_UpdateHooksAfterModeChange()
+ status_t
+ AccelerantHWInterface::Shutdown()
+ {
++	if (fFlipThread >= 0) {
++		fFlipQuit = true;
++		release_sem(fFlipSemaphore);
++		status_t result;
++		wait_for_thread(fFlipThread, &result);
++		fFlipThread = -1;
++	}
++	if (fFlipSemaphore >= 0) {
++		delete_sem(fFlipSemaphore);
++		fFlipSemaphore = -1;
++	}
++
+ 	if (fAccelerantHook != NULL) {
+ 		uninit_accelerant uninitAccelerant
+ 			= (uninit_accelerant)fAccelerantHook(B_UNINIT_ACCELERANT, NULL);
+@@ -571,8 +602,26 @@ AccelerantHWInterface::SetMode(const display_mode& mode)
+ 
+ 	display_mode newMode = mode;
+ 
++	// No flip may be under way while the frame buffer changes
++	BAutolock flipLocker(fFlipLock);
++	fFlipping = false;
++	fFlipGeneration++;
++
+ 	status_t status = B_ERROR;
+-	if (!use_fail_safe_video_mode() || !fInitialModeSwitch)
++	bool flipping = false;
++	if ((!use_fail_safe_video_mode() || !fInitialModeSwitch)
++		&& _CanFlip(mode)) {
++		// two screens high, to flip between them
++		display_mode doubled = mode;
++		doubled.virtual_height *= 2;
++		status = fAccSetDisplayMode(&doubled);
++		if (status == B_OK) {
++			flipping = true;
++			newMode = doubled;
++			newMode.virtual_height = doubled.timing.v_display;
++		}
++	}
++	if (status != B_OK && (!use_fail_safe_video_mode() || !fInitialModeSwitch))
+ 		status = fAccSetDisplayMode(&newMode);
+ 	if (status != B_OK) {
+ 		ATRACE(("setting display mode failed\n"));
+@@ -664,6 +713,28 @@ AccelerantHWInterface::SetMode(const display_mode& mode)
+ 	else if (fDisplayMode.space == B_GRAY8)
+ 		_SetGrayscalePalette();
+ 
++	// Both halves start blank; the screen is redrawn into the back buffer
++	// after a mode change, and from there it goes into each half in turn.
++	if (flipping && status == B_OK) {
++		if (fFlipSemaphore < 0)
++			fFlipSemaphore = create_sem(0, "page flip");
++		if (fFlipThread < 0 && fFlipSemaphore >= 0) {
++			fFlipThread = spawn_thread(_FlipThread, "page flip",
++				B_REAL_TIME_DISPLAY_PRIORITY, this);
++			if (fFlipThread >= 0)
++				resume_thread(fFlipThread);
++		}
++		if (fFlipThread >= 0) {
++			fDamageLock.Lock();
++			fDamage.MakeEmpty();
++			fDamageLock.Unlock();
++			fPreviousDamage.Set((clipping_rect)fBackBuffer->Bounds());
++			fHiddenHalf = 1;
++			fFlipping = true;
++			ATRACE(("page flipping between two screens\n"));
++		}
++	}
++
+ 	// notify all listeners about the mode change
+ 	_NotifyFrameBufferChanged();
+ 
+@@ -1375,7 +1446,142 @@ AccelerantHWInterface::IsDoubleBuffered() const
+ void
+ AccelerantHWInterface::_CopyBackToFront(/*const*/ BRegion& region)
+ {
+-	return HWInterface::_CopyBackToFront(region);
++	if (!fFlipping || find_thread(NULL) == fFlipThread) {
++		HWInterface::_CopyBackToFront(region);
++		return;
++	}
++
++	// the flip thread takes it from the back buffer
++	for (int32 i = 0; i < region.CountRects(); i++)
++		_AddDamage(region.RectAt(i));
++}
++
++
++/*!	While flipping, everything bound for the screen goes to the hidden half,
++	and only the flip thread writes there; the others note what changed.
++*/
++void
++AccelerantHWInterface::_CopyToFront(uint8* src, uint32 srcBPR, int32 x,
++	int32 y, int32 right, int32 bottom) const
++{
++	if (!fFlipping) {
++		HWInterface::_CopyToFront(src, srcBPR, x, y, right, bottom);
++		return;
++	}
++	if (find_thread(NULL) != fFlipThread) {
++		_AddDamage(BRect(x, y, right, bottom));
++		return;
++	}
++
++	// B_RGB32 only (see _CanFlip()); the back buffer's alpha goes along
++	uint32 dstBPR = fFrameBufferConfig.bytes_per_row;
++	uint8* dst = (uint8*)fFrameBufferConfig.frame_buffer
++		+ fHiddenHalf * dstBPR * fDisplayMode.timing.v_display
++		+ y * dstBPR + x * 4;
++	size_t bytes = (right - x + 1) * 4;
++	for (; y <= bottom; y++) {
++		memcpy(dst, src, bytes);
++		dst += dstBPR;
++		src += srcBPR;
++	}
++}
++
++
++// #pragma mark - page flipping
++
++
++bool
++AccelerantHWInterface::_CanFlip(const display_mode& mode) const
++{
++	if (fAccMoveDisplay == NULL || mode.space != B_RGB32
++		|| mode.virtual_width != mode.timing.h_display
++		|| mode.virtual_height != mode.timing.v_display)
++		return false;
++	// TEAR_FREE=0 in app_server's environment turns it off
++	const char* setting = getenv("TEAR_FREE");
++	return setting == NULL || strcmp(setting, "0") != 0;
++}
++
++
++void
++AccelerantHWInterface::_AddDamage(const BRect& frame) const
++{
++	fDamageLock.Lock();
++	bool wasEmpty = fDamage.CountRects() == 0;
++	fDamage.Include(frame);
++	fDamageLock.Unlock();
++	if (wasEmpty)
++		release_sem_etc(fFlipSemaphore, 1, B_DO_NOT_RESCHEDULE);
++}
++
++
++/*!	From the back buffer into the hidden half, with the software cursor (if
++	any) on top; on the flip thread, with the interface locked.
++*/
++void
++AccelerantHWInterface::_CopyToHidden(const BRegion& region)
++{
++	bool cursorLocked = fFloatingOverlaysLock.Lock();
++	BRegion copy(region);
++	copy.Exclude((clipping_rect)_CursorFrame());
++	HWInterface::_CopyBackToFront(copy);
++	_DrawCursor(IntRect(region.Frame()));
++	if (cursorLocked)
++		fFloatingOverlaysLock.Unlock();
++}
++
++
++status_t
++AccelerantHWInterface::_FlipThread(void* self)
++{
++	((AccelerantHWInterface*)self)->_FlipLoop();
++	return B_OK;
++}
++
++
++/*!	A frame: what was drawn since the last one (and what the hidden half
++	missed while it was shown) goes into the hidden half, which a flip then
++	shows at the next vertical blank. At most one frame per refresh, as the
++	flip waits for it.
++*/
++void
++AccelerantHWInterface::_FlipLoop()
++{
++	while (!fFlipQuit) {
++		if (acquire_sem(fFlipSemaphore) != B_OK)
++			break;
++		if (fFlipQuit)
++			break;
++		if (!LockExclusiveAccess())
++			continue;
++		if (!fFlipping) {
++			UnlockExclusiveAccess();
++			continue;
++		}
++
++		fDamageLock.Lock();
++		BRegion damage(fDamage);
++		fDamage.MakeEmpty();
++		fDamageLock.Unlock();
++		BRegion copy(damage);
++		copy.Include(&fPreviousDamage);
++		BRegion bounds;
++		bounds.Set((clipping_rect)fBackBuffer->Bounds());
++		copy.IntersectWith(&bounds);
++		if (copy.CountRects() > 0)
++			_CopyToHidden(copy);
++		fPreviousDamage = damage;
++		uint32 generation = fFlipGeneration;
++		int32 half = fHiddenHalf;
++		UnlockExclusiveAccess();
++
++		BAutolock flipLocker(fFlipLock);
++		if (!fFlipping || generation != fFlipGeneration)
++			continue;
++		if (fAccMoveDisplay(0, half * fDisplayMode.timing.v_display) != B_OK)
++			continue;
++		fHiddenHalf = 1 - half;
++	}
+ }
+ 
+ 
+diff --git a/src/servers/app/drawing/interface/local/AccelerantHWInterface.h b/src/servers/app/drawing/interface/local/AccelerantHWInterface.h
+index 7717b03f8e..dc9978915b 100644
+--- a/src/servers/app/drawing/interface/local/AccelerantHWInterface.h
++++ b/src/servers/app/drawing/interface/local/AccelerantHWInterface.h
+@@ -14,6 +14,8 @@
+ #include "HWInterface.h"
+ 
+ #include <AutoDeleter.h>
++#include <Locker.h>
++#include <Region.h>
+ #include <image.h>
+ #include <video_overlay.h>
+ 
+@@ -88,6 +90,8 @@ public:
+ 
+ protected:
+ 	virtual	void				_CopyBackToFront(/*const*/ BRegion& region);
++	virtual	void				_CopyToFront(uint8* src, uint32 srcBPR, int32 x,
++									int32 y, int32 right, int32 bottom) const;
+ 
+ 	virtual	void				_DrawCursor(IntRect area) const;
+ 
+@@ -169,6 +173,30 @@ private:
+ 			display_mode		fDisplayMode;
+ 			bool				fInitialModeSwitch;
+ 
++			// tear-free page flipping: drawing goes to the back buffer as
++			// ever, but only the flip thread copies it out, into the hidden
++			// half of a frame buffer two screens high, and flips
++			move_display_area	fAccMoveDisplay;
++			bool				fFlipping;
++			uint32				fFlipGeneration;	// bumped by mode changes
++			int32				fHiddenHalf;
++			thread_id			fFlipThread;
++			sem_id				fFlipSemaphore;
++			volatile bool		fFlipQuit;
++			BLocker				fFlipLock;
++				// held around a flip; SetMode() waits for it
++			mutable BLocker		fDamageLock;
++			mutable BRegion		fDamage;
++				// drawn since the last flip, not yet in the hidden half
++			BRegion				fPreviousDamage;
++				// what went into the other half the last time
++
++			bool				_CanFlip(const display_mode& mode) const;
++			void				_AddDamage(const BRect& frame) const;
++			void				_CopyToHidden(const BRegion& region);
++	static	status_t			_FlipThread(void* self);
++			void				_FlipLoop();
++
+ 			sem_id				fRetraceSemaphore;
+ 
+ 	mutable	fill_rect_params*	fRectParams;

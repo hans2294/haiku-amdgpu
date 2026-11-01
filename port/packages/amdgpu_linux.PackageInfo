@@ -1,0 +1,28 @@
+name			amdgpu_linux
+version			6.12.115-1
+architecture	x86_64
+summary			"Linux's amdgpu graphics driver on linuxkpi"
+description		"Linux 6.12's amdgpu DRM driver, unchanged, running in the Haiku \
+kernel on linuxkpi: /dev/dri/card0 and renderD128 with the Linux UAPI, a \
+graphics node for app_server, and amdgpu_kms.accelerant, which puts the \
+desktop on the card through KMS (hardware cursor, retrace semaphore, \
+tear-free page flipping). With the Navi 31 firmware (PSP, SMU, DMCUB, ...)."
+packager		"hans2294 <22217531+hans2294@users.noreply.github.com>"
+vendor			"hans2294"
+copyrights		{
+	"Advanced Micro Devices, Inc. and the Linux kernel authors"
+	"2026 hans2294 (linuxkpi, Haiku glue)"
+}
+licenses		{
+	"GNU GPL v2"
+	"MIT"
+}
+provides {
+	amdgpu_linux = 6.12.115
+}
+# No minimum version here: the haiku package counts as compatible back to
+# R1~alpha, so neither "requires haiku >= ..." nor "conflicts { haiku < ... }"
+# stops pkgman. The driver refuses a kernel that is too old itself.
+requires {
+	haiku
+}

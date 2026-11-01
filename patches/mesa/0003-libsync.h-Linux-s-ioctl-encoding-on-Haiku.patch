@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 03:09:11 +0100
+Subject: [PATCH] libsync.h: Linux's ioctl encoding on Haiku
+
+radeonsi's DRI frontend uses Mesa's copy of libsync.h; like libdrm's, it
+takes _IOWR() from the sys/ioccom.h libdrm installs for linuxkpi.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/util/libsync.h | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/util/libsync.h b/src/util/libsync.h
+index b22b75a..d412cf2 100644
+--- a/src/util/libsync.h
++++ b/src/util/libsync.h
+@@ -36,6 +36,9 @@
+ #include <string.h>
+ #include <sys/types.h>
+ #include <sys/ioctl.h>
++#ifdef __HAIKU__
++#include <sys/ioccom.h>	/* Linux's _IOWR() for linuxkpi, from libdrm */
++#endif
+ #include <unistd.h>
+ #include <stdlib.h>
+ #include <time.h>

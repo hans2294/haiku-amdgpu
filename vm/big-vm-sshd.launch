@@ -1,0 +1,3 @@
+job x-vnd.linuxkpi-big-vm-sshd {
+	launch /bin/sh /boot/system/non-packaged/bin/big-vm-sshd.sh
+}

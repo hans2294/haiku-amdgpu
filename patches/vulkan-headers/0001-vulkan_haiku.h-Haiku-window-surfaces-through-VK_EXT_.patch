@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 02:41:10 +0100
+Subject: [PATCH] vulkan_haiku.h: Haiku window surfaces through
+ VK_EXT_headless_surface
+
+A local structure, chained into VkHeadlessSurfaceCreateInfoEXT, carries
+the BView a driver presents into; its type lies in an unassigned block.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/vulkan/vulkan_haiku.h | 39 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+ create mode 100644 include/vulkan/vulkan_haiku.h
+
+diff --git a/include/vulkan/vulkan_haiku.h b/include/vulkan/vulkan_haiku.h
+new file mode 100644
+index 0000000..30e9db6
+--- /dev/null
++++ b/include/vulkan/vulkan_haiku.h
+@@ -0,0 +1,39 @@
++#ifndef VULKAN_HAIKU_H_
++#define VULKAN_HAIKU_H_ 1
++
++/*
++** Copyright 2026, hans2294.
++** Distributed under the terms of the MIT License.
++*/
++
++/*
++ * Vulkan surfaces in Haiku windows, ahead of a registered extension: chain a
++ * VkHaikuViewSurfaceCreateInfoHAIKU into the VkHeadlessSurfaceCreateInfoEXT
++ * of vkCreateHeadlessSurfaceEXT (VK_EXT_headless_surface). A driver that
++ * knows the structure presents into the BView, and the swapchain extent
++ * follows the view's bounds; others ignore it and make a headless surface.
++ *
++ * The structure type is not one Khronos handed out (it lies in the block
++ * of extension number 1000); it is local to this Haiku port.
++ */
++
++#include "vulkan_core.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define VK_STRUCTURE_TYPE_HAIKU_VIEW_SURFACE_CREATE_INFO_HAIKU \
++    ((VkStructureType)1000999000)
++
++typedef struct VkHaikuViewSurfaceCreateInfoHAIKU {
++    VkStructureType    sType;
++    const void*        pNext;
++    void*              view;    /* a BView* in a window; must outlive the surface */
++} VkHaikuViewSurfaceCreateInfoHAIKU;
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif

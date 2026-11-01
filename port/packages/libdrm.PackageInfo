@@ -1,0 +1,21 @@
+name			libdrm
+version			2.4.134-1
+architecture	x86_64
+summary			"Userspace interface to Linux DRM drivers on linuxkpi"
+description		"libdrm and libdrm_amdgpu for DRM drivers on Haiku's linuxkpi: \
+device nodes tell their Linux dev_t and PCI device through a linuxkpi ioctl, \
+buffers are mapped with linuxkpi's mmap ioctl, and dma-buf fds are Haiku \
+fds. With the AMDGPU marketing name table (amdgpu.ids)."
+packager		"hans2294 <22217531+hans2294@users.noreply.github.com>"
+vendor			"hans2294"
+copyrights		{ "2007-2026 the libdrm authors" }
+licenses		{ "MIT" }
+provides {
+	libdrm = 2.4.134
+	lib:libdrm = 2.4.134
+	lib:libdrm_amdgpu = 2.4.134
+}
+requires {
+	haiku
+	lib:libgcc_s
+}

@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 10:36:55 +0100
+Subject: [PATCH] haiku: direct presents into both screens when app_server
+ flips
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/haiku-gl/GLView.cpp              | 25 +++++++++++++++++++++----
+ src/vulkan/wsi/wsi_common_haiku.cpp  | 11 ++++++++++-
+ src/vulkan/wsi/wsi_common_haiku.h    |  5 +++--
+ src/vulkan/wsi/wsi_common_headless.c | 19 ++++++++++++-------
+ 4 files changed, 46 insertions(+), 14 deletions(-)
+
+diff --git a/src/haiku-gl/GLView.cpp b/src/haiku-gl/GLView.cpp
+index b230ccd..4302ef9 100644
+--- a/src/haiku-gl/GLView.cpp
++++ b/src/haiku-gl/GLView.cpp
+@@ -20,6 +20,8 @@
+  * visible parts of the view that DirectConnected() reported. It finishes
+  * the blit before it lets go of fDrawLock, so a B_DIRECT_STOP (which takes
+  * that lock) returns only once nothing more lands in the frame buffer.
++ * When app_server flips between two screens in one buffer (tear-free
++ * desktop), frames go into both, so whichever is shown next has them.
+  *
+  * Locking: fDisplayLock is the GL lock (LockGL()/UnlockGL(), the context is
+  * current while it is held); fDrawLock guards the bitmap and the direct
+@@ -37,6 +39,7 @@
+ 
+ #include <fcntl.h>
+ #include <new>
++#include <sys/ioctl.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -48,6 +51,7 @@
+ #include <GL/glext.h>
+ 
+ #include <drm_fourcc.h>
++#include <linuxkpi/uapi.h>
+ #include <xf86drm.h>
+ #include <xf86drmMode.h>
+ 
+@@ -87,6 +91,8 @@ struct glview_state {
+ 	EGLImage screenImage;
+ 	GLuint screenRenderbuffer;
+ 	GLuint screenFramebuffer;
++	int32 screenHeight;		/* of one screen */
++	int32 screenCount;		/* screens in the buffer: 2 when flipping */
+ };
+ 
+ 
+@@ -232,6 +238,8 @@ import_screen(glview_state* state)
+ 	}
+ 	drmModeFreeResources(resources);
+ 
++	// The framebuffer is one screen; its buffer may hold two (app_server
++	// flipping between them), which the dma-buf's size tells.
+ 	drmModeFBPtr framebuffer = framebufferID != 0
+ 		? drmModeGetFB(fd, framebufferID) : NULL;
+ 	if (framebuffer == NULL || framebuffer->handle == 0
+@@ -247,10 +255,15 @@ import_screen(glview_state* state)
+ 		drmModeFreeFB(framebuffer);
+ 		return false;
+ 	}
++	struct linuxkpi_file_size size = {};
++	ioctl(dmaBuf, LINUXKPI_IOCTL_FILE_SIZE, &size, sizeof(size));
++	state->screenHeight = framebuffer->height;
++	state->screenCount = size.size >= 2ull * framebuffer->pitch
++			* framebuffer->height ? 2 : 1;
+ 
+ 	const EGLAttrib attributes[] = {
+ 		EGL_WIDTH, (EGLAttrib)framebuffer->width,
+-		EGL_HEIGHT, (EGLAttrib)framebuffer->height,
++		EGL_HEIGHT, (EGLAttrib)(framebuffer->height * state->screenCount),
+ 		EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_XRGB8888,
+ 		EGL_DMA_BUF_PLANE0_FD_EXT, dmaBuf,
+ 		EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+@@ -327,9 +340,13 @@ blit_to_screen(glview_state* state, bool doubleBuffered)
+ 		int32 bottom = min_c(clip.bottom, view.bottom);
+ 		if (left > right || top > bottom)
+ 			continue;
+-		glScissor(left, top, right - left + 1, bottom - top + 1);
+-		glBlitFramebuffer(0, 0, width, height, view.left, view.top + height,
+-			view.left + width, view.top, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++		for (int32 screen = 0; screen < state->screenCount; screen++) {
++			int32 y = screen * state->screenHeight;
++			glScissor(left, top + y, right - left + 1, bottom - top + 1);
++			glBlitFramebuffer(0, 0, width, height, view.left,
++				view.top + y + height, view.left + width, view.top + y,
++				GL_COLOR_BUFFER_BIT, GL_NEAREST);
++		}
+ 	}
+ 	glFinish();
+ 
+diff --git a/src/vulkan/wsi/wsi_common_haiku.cpp b/src/vulkan/wsi/wsi_common_haiku.cpp
+index 6739a97..02553fe 100644
+--- a/src/vulkan/wsi/wsi_common_haiku.cpp
++++ b/src/vulkan/wsi/wsi_common_haiku.cpp
+@@ -32,6 +32,9 @@
+ #include <View.h>
+ #include <Window.h>
+ 
++#include <sys/ioctl.h>
++
++#include <linuxkpi/uapi.h>
+ #include <xf86drm.h>
+ #include <xf86drmMode.h>
+ 
+@@ -284,7 +287,8 @@ wsi_haiku_direct_end(struct wsi_haiku_direct *direct)
+ /* The frame buffer's handle comes from the primary node, which hands it out
+  * without being master on linuxkpi; it leaves as a dma-buf. */
+ extern "C" int
+-wsi_haiku_screen_dma_buf(uint32_t *width, uint32_t *height, uint32_t *pitch)
++wsi_haiku_screen_dma_buf(uint32_t *width, uint32_t *height, uint32_t *pitch,
++                         uint32_t *screens)
+ {
+    int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+@@ -313,6 +317,11 @@ wsi_haiku_screen_dma_buf(uint32_t *width, uint32_t *height, uint32_t *pitch)
+       *width = framebuffer->width;
+       *height = framebuffer->height;
+       *pitch = framebuffer->pitch;
++      struct linuxkpi_file_size size = {};
++      if (dmaBuf >= 0)
++         ioctl(dmaBuf, LINUXKPI_IOCTL_FILE_SIZE, &size, sizeof(size));
++      *screens = size.size >= 2ull * framebuffer->pitch * framebuffer->height
++         ? 2 : 1;
+    }
+    drmModeFreeFB(framebuffer);
+    close(fd);
+diff --git a/src/vulkan/wsi/wsi_common_haiku.h b/src/vulkan/wsi/wsi_common_haiku.h
+index 8ff1d3a..e72daf5 100644
+--- a/src/vulkan/wsi/wsi_common_haiku.h
++++ b/src/vulkan/wsi/wsi_common_haiku.h
+@@ -57,9 +57,10 @@ bool wsi_haiku_direct_begin(struct wsi_haiku_direct *direct,
+ void wsi_haiku_direct_end(struct wsi_haiku_direct *direct);
+ 
+ /* A dma-buf fd for the frame buffer the CRTC shows (XRGB8888, linear), or
+- * -1. */
++ * -1; \p screens is how many screens its buffer holds (2 when app_server
++ * flips between them, and presents go into both). */
+ int wsi_haiku_screen_dma_buf(uint32_t *width, uint32_t *height,
+-                             uint32_t *pitch);
++                             uint32_t *pitch, uint32_t *screens);
+ 
+ /* Waits for the next vertical blank of the view's screen. */
+ void wsi_haiku_wait_retrace(void *view);
+diff --git a/src/vulkan/wsi/wsi_common_headless.c b/src/vulkan/wsi/wsi_common_headless.c
+index fbd26d1..f066980 100644
+--- a/src/vulkan/wsi/wsi_common_headless.c
++++ b/src/vulkan/wsi/wsi_common_headless.c
+@@ -455,6 +455,7 @@ struct wsi_headless_swapchain {
+    VkBuffer screen;
+    VkDeviceMemory screen_memory;
+    uint32_t screen_width, screen_height, screen_pitch;
++   uint32_t screen_count;   /* 2 when app_server flips between two */
+    uint32_t screen_generation;
+    bool screen_failed;
+ #endif
+@@ -550,8 +551,8 @@ haiku_import_screen(struct wsi_headless_swapchain *chain)
+ {
+    const struct wsi_device *wsi = chain->base.wsi;
+    VkDevice device = chain->base.device;
+-   uint32_t width, height, pitch;
+-   int fd = wsi_haiku_screen_dma_buf(&width, &height, &pitch);
++   uint32_t width, height, pitch, screens;
++   int fd = wsi_haiku_screen_dma_buf(&width, &height, &pitch, &screens);
+    if (fd < 0)
+       return VK_ERROR_FEATURE_NOT_PRESENT;
+ 
+@@ -562,7 +563,7 @@ haiku_import_screen(struct wsi_headless_swapchain *chain)
+    const VkBufferCreateInfo buffer_info = {
+       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+       .pNext = &external_info,
+-      .size = (VkDeviceSize)pitch * height,
++      .size = (VkDeviceSize)pitch * height * screens,
+       .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+@@ -609,6 +610,7 @@ haiku_import_screen(struct wsi_headless_swapchain *chain)
+    chain->screen_width = width;
+    chain->screen_height = height;
+    chain->screen_pitch = pitch;
++   chain->screen_count = screens;
+    return VK_SUCCESS;
+ }
+ 
+@@ -794,16 +796,19 @@ haiku_present_direct(struct wsi_headless_swapchain *chain, VkImage image,
+       chain->screen_generation = generation;
+    }
+ 
+-   STACK_ARRAY(VkBufferImageCopy, copies, MAX2(count, 1));
++   /* into every screen of the buffer, when app_server flips */
++   STACK_ARRAY(VkBufferImageCopy, copies, MAX2(count * chain->screen_count, 1));
+    uint32_t copy_count = 0;
+-   for (uint32_t i = 0; i < count; i++) {
+-      const struct wsi_haiku_region *region = &regions[i];
++   for (uint32_t i = 0; i < count * chain->screen_count; i++) {
++      const struct wsi_haiku_region *region = &regions[i % count];
++      uint32_t screen = i / count;
+       if (region->dst_x < 0 || region->dst_y < 0
+           || region->dst_x + region->width > chain->screen_width
+           || region->dst_y + region->height > chain->screen_height)
+          continue;
+       copies[copy_count++] = (VkBufferImageCopy) {
+-         .bufferOffset = (VkDeviceSize)region->dst_y * chain->screen_pitch
++         .bufferOffset = ((VkDeviceSize)screen * chain->screen_height
++               + region->dst_y) * chain->screen_pitch
+             + (VkDeviceSize)region->dst_x * 4,
+          .bufferRowLength = chain->screen_pitch / 4,
+          .imageSubresource = {

@@ -1,0 +1,879 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:38:23 +0100
+Subject: [PATCH] amdgpu_kms.accelerant: the desktop on Linux's KMS
+
+Hardware cursor, retrace semaphore, and a page flip feature for app_server.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/graphics/common/page_flip.h   |  18 +
+ src/add-ons/accelerants/Jamfile               |   1 +
+ src/add-ons/accelerants/amdgpu_kms/Jamfile    |  13 +
+ .../accelerants/amdgpu_kms/accelerant.cpp     | 800 ++++++++++++++++++
+ 4 files changed, 832 insertions(+)
+ create mode 100644 headers/private/graphics/common/page_flip.h
+ create mode 100644 src/add-ons/accelerants/amdgpu_kms/Jamfile
+ create mode 100644 src/add-ons/accelerants/amdgpu_kms/accelerant.cpp
+
+diff --git a/headers/private/graphics/common/page_flip.h b/headers/private/graphics/common/page_flip.h
+new file mode 100644
+index 0000000000..6c9bc14430
+--- /dev/null
++++ b/headers/private/graphics/common/page_flip.h
+@@ -0,0 +1,18 @@
++/*
++ * Copyright 2026, hans2294.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _PAGE_FLIP_H
++#define _PAGE_FLIP_H
++
++
++/*!	An accelerant that answers this feature with a non-NULL hook says that
++	it takes modes twice as high as the display (virtual_height), and that
++	its B_MOVE_DISPLAY to the top of either half is a page flip that lands
++	at a vertical blank and returns once it did. app_server then draws into
++	the hidden half and flips, for a tear-free screen.
++*/
++#define B_ACCELERANT_PAGE_FLIP_FEATURE	0x50464c50	/* 'PFLP' */
++
++
++#endif	// _PAGE_FLIP_H
+diff --git a/src/add-ons/accelerants/Jamfile b/src/add-ons/accelerants/Jamfile
+index 9b6a99e650..f30d3a89f7 100644
+--- a/src/add-ons/accelerants/Jamfile
++++ b/src/add-ons/accelerants/Jamfile
+@@ -1,6 +1,7 @@
+ SubDir HAIKU_TOP src add-ons accelerants ;
+ 
+ SubInclude HAIKU_TOP src add-ons accelerants 3dfx ;
++SubInclude HAIKU_TOP src add-ons accelerants amdgpu_kms ;
+ SubInclude HAIKU_TOP src add-ons accelerants ati ;
+ SubInclude HAIKU_TOP src add-ons accelerants common ;
+ SubInclude HAIKU_TOP src add-ons accelerants et6x00 ;
+diff --git a/src/add-ons/accelerants/amdgpu_kms/Jamfile b/src/add-ons/accelerants/amdgpu_kms/Jamfile
+new file mode 100644
+index 0000000000..c99e4e17ab
+--- /dev/null
++++ b/src/add-ons/accelerants/amdgpu_kms/Jamfile
+@@ -0,0 +1,13 @@
++SubDir HAIKU_TOP src add-ons accelerants amdgpu_kms ;
++
++# An accelerant on Linux's KMS through libdrm, for linuxkpi's DRM drivers
++UsePrivateHeaders [ FDirName graphics common ] ;
++local libdrmTop = [ FDirName $(HAIKU_TOP) .. libdrm ] ;
++SubDirSysHdrs $(libdrmTop) ;
++SubDirSysHdrs [ FDirName $(libdrmTop) include drm ] ;
++SubDirSysHdrs [ FDirName $(libdrmTop) haiku ] ;
++
++Addon amdgpu_kms.accelerant :
++	accelerant.cpp
++	: libaccelerantscommon.a libdrm.so
++	;
+diff --git a/src/add-ons/accelerants/amdgpu_kms/accelerant.cpp b/src/add-ons/accelerants/amdgpu_kms/accelerant.cpp
+new file mode 100644
+index 0000000000..641f66bfbb
+--- /dev/null
++++ b/src/add-ons/accelerants/amdgpu_kms/accelerant.cpp
+@@ -0,0 +1,800 @@
++/*
++ * Copyright 2026, hans2294.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*!	An accelerant on Linux's KMS: app_server's graphics device is a DRM
++	primary node of a linuxkpi driver (amdgpu), and everything goes through
++	libdrm on it. The modes are the first connected connector's, a mode is
++	set with a dumb buffer in VRAM as the frame buffer, and EDID comes from
++	the connector's property.
++
++	The cursor is the CRTC's cursor plane (a dumb buffer of the plane's
++	size), and the retrace semaphore is released by a thread that waits for
++	each vblank with drmWaitVBlank. No acceleration and no clones: app_server
++	draws into the frame buffer.
++
++	A mode twice as high as the display (virtual_height) gets a buffer for
++	two screens, with a KMS framebuffer for each half; B_MOVE_DISPLAY picks
++	the half to show with a page flip at the next vblank, and returns once
++	it is shown. app_server flips like that for a tear-free desktop.
++*/
++
++
++#include <Accelerant.h>
++#include <Debug.h>
++#include <OS.h>
++
++#include <errno.h>
++#include <new>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <drm_fourcc.h>
++#include <edid.h>
++#include <page_flip.h>
++#include <xf86drm.h>
++#include <xf86drmMode.h>
++
++
++#define LOG(x...)	_sPrintf("amdgpu_kms: " x)
++
++
++struct buffer {
++	uint32 handle;
++	uint32 framebuffer;
++	uint32 framebuffer2;	/* the lower half's, for a double height mode */
++	uint32 pitch;
++	uint64 size;
++	void* pixels;
++};
++
++static int sFD = -1;
++static uint32 sConnector;
++static uint32 sCrtc;
++static uint32 sCrtcIndex;
++static drmModeModeInfo* sModes;
++static uint32 sModeCount;
++static int32 sPreferredMode = -1;
++static display_mode* sDisplayModes;
++static display_mode sCurrentMode;
++static bool sModeSet;
++static buffer sBuffer;
++static uint32 sShownHalf;	/* of a double height mode */
++static drmModeModeInfo sKMSMode;	/* the one set */
++static edid1_info sEDID;
++static bool sHasEDID;
++
++static buffer sCursor;
++static uint32 sCursorSize;
++static uint16 sCursorHotX;
++static uint16 sCursorHotY;
++static uint16 sCursorX;
++static uint16 sCursorY;
++static bool sCursorVisible;
++
++static sem_id sRetraceSemaphore = -1;
++static thread_id sRetraceThread = -1;
++static volatile bool sRetraceQuit;
++
++
++//	#pragma mark - modes
++
++
++static void
++to_display_mode(const drmModeModeInfo& mode, display_mode& displayMode)
++{
++	memset(&displayMode, 0, sizeof(displayMode));
++	display_timing& timing = displayMode.timing;
++	timing.pixel_clock = mode.clock;
++	timing.h_display = mode.hdisplay;
++	timing.h_sync_start = mode.hsync_start;
++	timing.h_sync_end = mode.hsync_end;
++	timing.h_total = mode.htotal;
++	timing.v_display = mode.vdisplay;
++	timing.v_sync_start = mode.vsync_start;
++	timing.v_sync_end = mode.vsync_end;
++	timing.v_total = mode.vtotal;
++	if (mode.flags & DRM_MODE_FLAG_PHSYNC)
++		timing.flags |= B_POSITIVE_HSYNC;
++	if (mode.flags & DRM_MODE_FLAG_PVSYNC)
++		timing.flags |= B_POSITIVE_VSYNC;
++	displayMode.space = B_RGB32;
++	displayMode.virtual_width = mode.hdisplay;
++	displayMode.virtual_height = mode.vdisplay;
++	displayMode.flags = B_8_BIT_DAC | B_PARALLEL_ACCESS;
++}
++
++
++/*!	The connector's mode for a display_mode app_server asks for: the same
++	size, and of those the closest pixel clock.
++*/
++static const drmModeModeInfo*
++find_mode(const display_mode& displayMode)
++{
++	const drmModeModeInfo* best = NULL;
++	uint32 bestDistance = UINT32_MAX;
++	for (uint32 i = 0; i < sModeCount; i++) {
++		const drmModeModeInfo& mode = sModes[i];
++		if (mode.hdisplay != displayMode.timing.h_display
++			|| mode.vdisplay != displayMode.timing.v_display)
++			continue;
++		uint32 distance = abs((int32)mode.clock
++			- (int32)displayMode.timing.pixel_clock);
++		if (distance < bestDistance) {
++			best = &mode;
++			bestDistance = distance;
++		}
++	}
++	return best;
++}
++
++
++static void
++read_edid(drmModeConnectorPtr connector)
++{
++	for (int i = 0; i < connector->count_props && !sHasEDID; i++) {
++		drmModePropertyPtr property = drmModeGetProperty(sFD,
++			connector->props[i]);
++		if (property == NULL)
++			continue;
++		if (strcmp(property->name, "EDID") == 0
++			&& connector->prop_values[i] != 0) {
++			drmModePropertyBlobPtr blob = drmModeGetPropertyBlob(sFD,
++				connector->prop_values[i]);
++			if (blob != NULL && blob->length >= sizeof(edid1_raw)) {
++				edid_decode(&sEDID, (const edid1_raw*)blob->data);
++				sHasEDID = true;
++			}
++			drmModeFreePropertyBlob(blob);
++		}
++		drmModeFreeProperty(property);
++	}
++}
++
++
++static status_t
++find_output()
++{
++	drmModeResPtr resources = drmModeGetResources(sFD);
++	if (resources == NULL) {
++		LOG("no KMS resources: %s\n", strerror(errno));
++		return B_ERROR;
++	}
++
++	drmModeConnectorPtr connector = NULL;
++	for (int i = 0; i < resources->count_connectors && connector == NULL; i++) {
++		connector = drmModeGetConnector(sFD, resources->connectors[i]);
++		if (connector != NULL && (connector->connection != DRM_MODE_CONNECTED
++				|| connector->count_modes == 0)) {
++			drmModeFreeConnector(connector);
++			connector = NULL;
++		}
++	}
++	if (connector == NULL) {
++		LOG("no connected connector\n");
++		drmModeFreeResources(resources);
++		return B_ERROR;
++	}
++
++	sCrtc = 0;
++	for (int e = 0; e < connector->count_encoders && sCrtc == 0; e++) {
++		drmModeEncoderPtr encoder = drmModeGetEncoder(sFD,
++			connector->encoders[e]);
++		if (encoder == NULL)
++			continue;
++		for (int c = 0; c < resources->count_crtcs; c++) {
++			if (encoder->possible_crtcs & (1u << c)) {
++				sCrtc = resources->crtcs[c];
++				sCrtcIndex = c;
++				break;
++			}
++		}
++		drmModeFreeEncoder(encoder);
++	}
++
++	// Interlaced and double scan modes are left out; app_server cannot use
++	// them anyway.
++	sConnector = connector->connector_id;
++	sModes = new(std::nothrow) drmModeModeInfo[connector->count_modes];
++	sDisplayModes = new(std::nothrow) display_mode[connector->count_modes];
++	if (sModes == NULL || sDisplayModes == NULL) {
++		drmModeFreeConnector(connector);
++		drmModeFreeResources(resources);
++		return B_NO_MEMORY;
++	}
++	sModeCount = 0;
++	for (int i = 0; i < connector->count_modes; i++) {
++		const drmModeModeInfo& mode = connector->modes[i];
++		if (mode.flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLSCAN))
++			continue;
++		if ((mode.type & DRM_MODE_TYPE_PREFERRED) && sPreferredMode < 0)
++			sPreferredMode = sModeCount;
++		sModes[sModeCount] = mode;
++		to_display_mode(mode, sDisplayModes[sModeCount]);
++		sModeCount++;
++	}
++	read_edid(connector);
++	LOG("connector %" B_PRIu32 ", CRTC %" B_PRIu32 ", %" B_PRIu32
++		" modes, preferred %s\n", sConnector, sCrtc, sModeCount,
++		sPreferredMode >= 0 ? sModes[sPreferredMode].name : "none");
++
++	drmModeFreeConnector(connector);
++	drmModeFreeResources(resources);
++	return sCrtc != 0 && sModeCount > 0 ? B_OK : B_ERROR;
++}
++
++
++static void
++free_buffer(buffer& buffer)
++{
++	if (buffer.pixels != NULL)
++		drmUnmap(buffer.pixels, buffer.size);
++	if (buffer.framebuffer != 0)
++		drmModeRmFB(sFD, buffer.framebuffer);
++	if (buffer.framebuffer2 != 0)
++		drmModeRmFB(sFD, buffer.framebuffer2);
++	if (buffer.handle != 0) {
++		drm_mode_destroy_dumb destroy = {};
++		destroy.handle = buffer.handle;
++		drmIoctl(sFD, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
++	}
++	memset(&buffer, 0, sizeof(buffer));
++}
++
++
++/*!	A dumb buffer in VRAM, mapped; with \a scanout also a KMS framebuffer
++	for it.
++*/
++static status_t
++create_buffer(uint32 width, uint32 height, buffer& buffer, bool scanout = true)
++{
++	memset(&buffer, 0, sizeof(buffer));
++	drm_mode_create_dumb create = {};
++	create.width = width;
++	create.height = height;
++	create.bpp = 32;
++	if (drmIoctl(sFD, DRM_IOCTL_MODE_CREATE_DUMB, &create) != 0)
++		return B_NO_MEMORY;
++	buffer.handle = create.handle;
++	buffer.pitch = create.pitch;
++	buffer.size = create.size;
++
++	drm_mode_map_dumb map = {};
++	map.handle = create.handle;
++	if (drmIoctl(sFD, DRM_IOCTL_MODE_MAP_DUMB, &map) != 0
++		|| drmMap(sFD, map.offset, create.size, &buffer.pixels) != 0
++		|| (scanout && drmModeAddFB(sFD, width, height, 24, 32, create.pitch,
++			create.handle, &buffer.framebuffer) != 0)) {
++		free_buffer(buffer);
++		return B_ERROR;
++	}
++	memset(buffer.pixels, 0, buffer.size);
++	return B_OK;
++}
++
++
++//	#pragma mark - retrace
++
++
++/*!	Releases everyone waiting on the retrace semaphore at each vblank of
++	the CRTC. Without a mode (or when the wait fails otherwise) it falls
++	back to 60 Hz, so waiters never hang.
++*/
++static status_t
++retrace_thread(void*)
++{
++	bool failed = false;
++	while (!sRetraceQuit) {
++		drmVBlank vblank = {};
++		vblank.request.type = (drmVBlankSeqType)(DRM_VBLANK_RELATIVE
++			| ((sCrtcIndex << DRM_VBLANK_HIGH_CRTC_SHIFT)
++				& DRM_VBLANK_HIGH_CRTC_MASK));
++		vblank.request.sequence = 1;
++		if (!sModeSet || drmWaitVBlank(sFD, &vblank) != 0) {
++			if (sModeSet && !failed)
++				LOG("waiting for vblank failed: %s\n", strerror(errno));
++			failed = sModeSet;
++			snooze(1000000 / 60);
++		}
++
++		int32 count;
++		if (get_sem_count(sRetraceSemaphore, &count) == B_OK && count < 0)
++			release_sem_etc(sRetraceSemaphore, -count, B_DO_NOT_RESCHEDULE);
++	}
++	return B_OK;
++}
++
++
++/*!	The framebuffer for a half of a double height buffer: the same
++	memory, starting \a half screens down.
++*/
++static status_t
++add_half_framebuffer(buffer& buffer, uint32 width, uint32 height, int half,
++	uint32* _framebuffer)
++{
++	uint32 handles[4] = { buffer.handle };
++	uint32 pitches[4] = { buffer.pitch };
++	uint32 offsets[4] = { half * buffer.pitch * height };
++	return drmModeAddFB2(sFD, width, height, DRM_FORMAT_XRGB8888, handles,
++		pitches, offsets, _framebuffer, 0) == 0 ? B_OK : B_ERROR;
++}
++
++
++static void
++page_flip_done(int fd, unsigned int frame, unsigned int seconds,
++	unsigned int microseconds, void* data)
++{
++	*(bool*)data = true;
++}
++
++
++//	#pragma mark - cursor
++
++
++/*!	Shows the cursor buffer on the cursor plane, or takes it off. */
++static void
++update_cursor()
++{
++	if (!sCursorVisible || sCursor.handle == 0) {
++		drmModeSetCursor(sFD, sCrtc, 0, 0, 0);
++		return;
++	}
++	static bool sLogged;
++	if (drmModeSetCursor2(sFD, sCrtc, sCursor.handle, sCursorSize,
++			sCursorSize, sCursorHotX, sCursorHotY) != 0)
++		LOG("setting the cursor failed: %s\n", strerror(errno));
++	else if (!sLogged) {
++		LOG("cursor on the cursor plane\n");
++		sLogged = true;
++	}
++	drmModeMoveCursor(sFD, sCrtc, (int32)sCursorX - sCursorHotX,
++		(int32)sCursorY - sCursorHotY);
++}
++
++
++/*!	The cursor buffer, cleared, for a cursor of \a width x \a height;
++	returns the first pixel or NULL if the plane cannot show it.
++*/
++static uint32*
++prepare_cursor(uint16 width, uint16 height, uint16 hotX, uint16 hotY)
++{
++	if (width > sCursorSize || height > sCursorSize)
++		return NULL;
++	if (sCursor.handle == 0
++		&& create_buffer(sCursorSize, sCursorSize, sCursor, false) != B_OK) {
++		LOG("no cursor buffer\n");
++		return NULL;
++	}
++	memset(sCursor.pixels, 0, sCursor.size);
++	sCursorHotX = hotX;
++	sCursorHotY = hotY;
++	return (uint32*)sCursor.pixels;
++}
++
++
++//	#pragma mark - hooks
++
++
++static status_t
++amdgpu_kms_init_accelerant(int fd)
++{
++	sFD = fd;
++	status_t status = find_output();
++	if (status != B_OK) {
++		sFD = -1;
++		return status;
++	}
++
++	// The cursor plane only takes square buffers whose pitch is 64, 128 or
++	// 256 pixels.
++	uint64 cursorWidth = 64;
++	drmGetCap(sFD, DRM_CAP_CURSOR_WIDTH, &cursorWidth);
++	sCursorSize = cursorWidth >= 256 ? 256 : cursorWidth >= 128 ? 128 : 64;
++	LOG("hardware cursor up to %" B_PRIu32 "x%" B_PRIu32 "\n", sCursorSize,
++		sCursorSize);
++	return B_OK;
++}
++
++
++static void
++amdgpu_kms_uninit_accelerant()
++{
++	if (sRetraceThread >= 0) {
++		sRetraceQuit = true;
++		status_t result;
++		wait_for_thread(sRetraceThread, &result);
++		sRetraceThread = -1;
++	}
++	if (sRetraceSemaphore >= 0)
++		delete_sem(sRetraceSemaphore);
++	sRetraceSemaphore = -1;
++
++	if (sCursor.handle != 0)
++		drmModeSetCursor(sFD, sCrtc, 0, 0, 0);
++	free_buffer(sCursor);
++	free_buffer(sBuffer);
++	delete[] sModes;
++	delete[] sDisplayModes;
++	sModes = NULL;
++	sDisplayModes = NULL;
++	sFD = -1;
++}
++
++
++static ssize_t
++amdgpu_kms_clone_info_size()
++{
++	return 0;
++}
++
++
++static void
++amdgpu_kms_get_clone_info(void* data)
++{
++}
++
++
++static status_t
++amdgpu_kms_clone_accelerant(void* data)
++{
++	// A clone would need the frame buffer shared between DRM files.
++	return B_NOT_SUPPORTED;
++}
++
++
++static status_t
++amdgpu_kms_get_device_info(accelerant_device_info* info)
++{
++	info->version = B_ACCELERANT_VERSION;
++	drmVersionPtr version = drmGetVersion(sFD);
++	snprintf(info->name, sizeof(info->name), "%s (Linux KMS)",
++		version != NULL ? version->name : "DRM");
++	strlcpy(info->chipset, version != NULL ? version->desc : "",
++		sizeof(info->chipset));
++	drmFreeVersion(version);
++	strlcpy(info->serial_no, "", sizeof(info->serial_no));
++	info->memory = 0;
++	info->dac_speed = 0;
++	return B_OK;
++}
++
++
++static sem_id
++amdgpu_kms_retrace_semaphore()
++{
++	// The thread only runs once someone asked for the semaphore.
++	if (sRetraceSemaphore < 0) {
++		sRetraceSemaphore = create_sem(0, "amdgpu_kms retrace");
++		if (sRetraceSemaphore < 0)
++			return sRetraceSemaphore;
++		sRetraceQuit = false;
++		sRetraceThread = spawn_thread(retrace_thread, "amdgpu_kms retrace",
++			B_REAL_TIME_DISPLAY_PRIORITY, NULL);
++		if (sRetraceThread < 0 || resume_thread(sRetraceThread) != B_OK) {
++			delete_sem(sRetraceSemaphore);
++			sRetraceSemaphore = -1;
++			return B_ERROR;
++		}
++	}
++	return sRetraceSemaphore;
++}
++
++
++static uint32
++amdgpu_kms_mode_count()
++{
++	return sModeCount;
++}
++
++
++static status_t
++amdgpu_kms_get_mode_list(display_mode* modes)
++{
++	memcpy(modes, sDisplayModes, sModeCount * sizeof(display_mode));
++	return B_OK;
++}
++
++
++static status_t
++amdgpu_kms_propose_display_mode(display_mode* target, const display_mode* low,
++	const display_mode* high)
++{
++	const drmModeModeInfo* mode = find_mode(*target);
++	if (mode == NULL || target->space != B_RGB32)
++		return B_BAD_VALUE;
++	bool doubled = target->virtual_height == 2 * mode->vdisplay;
++	to_display_mode(*mode, *target);
++	if (doubled)
++		target->virtual_height *= 2;
++	return B_OK;
++}
++
++
++static status_t
++amdgpu_kms_set_display_mode(display_mode* displayMode)
++{
++	const drmModeModeInfo* mode = find_mode(*displayMode);
++	if (mode == NULL || displayMode->space != B_RGB32) {
++		LOG("no mode for %ux%u\n", displayMode->timing.h_display,
++			displayMode->timing.v_display);
++		return B_BAD_VALUE;
++	}
++
++	bool doubled = displayMode->virtual_height == 2 * mode->vdisplay;
++	buffer newBuffer;
++	status_t status = create_buffer(mode->hdisplay,
++		mode->vdisplay * (doubled ? 2 : 1), newBuffer, !doubled);
++	if (status == B_OK && doubled) {
++		status = add_half_framebuffer(newBuffer, mode->hdisplay,
++			mode->vdisplay, 0, &newBuffer.framebuffer);
++		if (status == B_OK) {
++			status = add_half_framebuffer(newBuffer, mode->hdisplay,
++				mode->vdisplay, 1, &newBuffer.framebuffer2);
++		}
++		if (status != B_OK)
++			free_buffer(newBuffer);
++	}
++	if (status != B_OK) {
++		LOG("no frame buffer for %s%s\n", mode->name,
++			doubled ? " (double height)" : "");
++		return status;
++	}
++	drmModeModeInfo kmsMode = *mode;
++	if (drmModeSetCrtc(sFD, sCrtc, newBuffer.framebuffer, 0, 0, &sConnector,
++			1, &kmsMode) != 0) {
++		LOG("setting %s failed: %s\n", mode->name, strerror(errno));
++		free_buffer(newBuffer);
++		return B_ERROR;
++	}
++
++	free_buffer(sBuffer);
++	sBuffer = newBuffer;
++	sShownHalf = 0;
++	sKMSMode = kmsMode;
++	to_display_mode(*mode, sCurrentMode);
++	if (doubled)
++		sCurrentMode.virtual_height *= 2;
++	sModeSet = true;
++	LOG("mode %s, %u Hz, frame buffer at %p, %" B_PRIu32 " bytes per row%s\n",
++		mode->name, mode->vrefresh, sBuffer.pixels, sBuffer.pitch,
++		doubled ? ", two screens high" : "");
++	return B_OK;
++}
++
++
++static status_t
++amdgpu_kms_get_display_mode(display_mode* displayMode)
++{
++	if (!sModeSet)
++		return B_ERROR;
++	*displayMode = sCurrentMode;
++	return B_OK;
++}
++
++
++static status_t
++amdgpu_kms_get_preferred_display_mode(display_mode* displayMode)
++{
++	if (sPreferredMode < 0)
++		return B_ERROR;
++	*displayMode = sDisplayModes[sPreferredMode];
++	return B_OK;
++}
++
++
++static status_t
++amdgpu_kms_get_edid_info(void* info, size_t size, uint32* _version)
++{
++	if (!sHasEDID)
++		return B_ERROR;
++	if (size < sizeof(edid1_info))
++		return B_BUFFER_OVERFLOW;
++	memcpy(info, &sEDID, sizeof(edid1_info));
++	*_version = EDID_VERSION_1;
++	return B_OK;
++}
++
++
++static status_t
++amdgpu_kms_get_frame_buffer_config(frame_buffer_config* config)
++{
++	if (!sModeSet)
++		return B_ERROR;
++	config->frame_buffer = sBuffer.pixels;
++	config->frame_buffer_dma = NULL;
++	config->bytes_per_row = sBuffer.pitch;
++	return B_OK;
++}
++
++
++static status_t
++amdgpu_kms_get_pixel_clock_limits(display_mode* displayMode, uint32* low,
++	uint32* high)
++{
++	const drmModeModeInfo* mode = find_mode(*displayMode);
++	if (mode == NULL)
++		return B_BAD_VALUE;
++	*low = *high = mode->clock;
++	return B_OK;
++}
++
++
++/*!	A BeOS cursor: 1 bits in \a andMask are transparent, 1 bits in
++	\a xorMask black; inverted pixels (both set) come out black, too.
++*/
++static status_t
++amdgpu_kms_set_cursor_shape(uint16 width, uint16 height, uint16 hotX,
++	uint16 hotY, const uint8* andMask, const uint8* xorMask)
++{
++	uint32* pixels = prepare_cursor(width, height, hotX, hotY);
++	if (pixels == NULL)
++		return B_BAD_VALUE;
++	uint32 bytesPerRow = (width + 7) / 8;
++	for (uint16 y = 0; y < height; y++) {
++		for (uint16 x = 0; x < width; x++) {
++			uint32 byte = y * bytesPerRow + x / 8;
++			uint8 bit = 0x80 >> (x % 8);
++			bool transparent = (andMask[byte] & bit) != 0;
++			bool black = (xorMask[byte] & bit) != 0;
++			if (!transparent || black)
++				pixels[y * sCursorSize + x] = black ? 0xff000000 : 0xffffffff;
++		}
++	}
++	update_cursor();
++	return B_OK;
++}
++
++
++/*!	A B_RGBA32 cursor. The plane wants premultiplied alpha. */
++static status_t
++amdgpu_kms_set_cursor_bitmap(uint16 width, uint16 height, uint16 hotX,
++	uint16 hotY, color_space colorSpace, uint16 bytesPerRow,
++	const uint8* bitmapData)
++{
++	if (colorSpace != B_RGBA32)
++		return B_BAD_VALUE;
++	uint32* pixels = prepare_cursor(width, height, hotX, hotY);
++	if (pixels == NULL)
++		return B_BAD_VALUE;
++	for (uint16 y = 0; y < height; y++) {
++		const uint32* source = (const uint32*)(bitmapData + y * bytesPerRow);
++		for (uint16 x = 0; x < width; x++) {
++			uint32 color = source[x];
++			uint32 alpha = color >> 24;
++			uint32 red = ((color >> 16) & 0xff) * alpha / 255;
++			uint32 green = ((color >> 8) & 0xff) * alpha / 255;
++			uint32 blue = (color & 0xff) * alpha / 255;
++			pixels[y * sCursorSize + x] = alpha << 24 | red << 16 | green << 8
++				| blue;
++		}
++	}
++	update_cursor();
++	return B_OK;
++}
++
++
++static void
++amdgpu_kms_move_cursor(uint16 x, uint16 y)
++{
++	sCursorX = x;
++	sCursorY = y;
++	if (sCursorVisible && sCursor.handle != 0) {
++		drmModeMoveCursor(sFD, sCrtc, (int32)x - sCursorHotX,
++			(int32)y - sCursorHotY);
++	}
++}
++
++
++static void
++amdgpu_kms_show_cursor(bool isVisible)
++{
++	sCursorVisible = isVisible;
++	update_cursor();
++}
++
++
++/*!	Shows the half of a double height buffer that starts at \a top: a page
++	flip, which lands at the next vblank; returns once it did.
++*/
++static status_t
++amdgpu_kms_move_display(uint16 left, uint16 top)
++{
++	if (!sModeSet || sBuffer.framebuffer2 == 0 || left != 0)
++		return top == 0 && left == 0 ? B_OK : B_BAD_VALUE;
++	uint32 half = top >= sCurrentMode.timing.v_display ? 1 : 0;
++	if (top != 0 && top != sCurrentMode.timing.v_display)
++		return B_BAD_VALUE;
++	if (half == sShownHalf)
++		return B_OK;
++
++	uint32 framebuffer = half == 0 ? sBuffer.framebuffer : sBuffer.framebuffer2;
++	bool done = false;
++	if (drmModePageFlip(sFD, sCrtc, framebuffer, DRM_MODE_PAGE_FLIP_EVENT,
++			&done) != 0) {
++		// no flip (the CRTC is off, say): show it right away instead
++		static bool sTold;
++		if (!sTold) {
++			LOG("page flip failed (%s), setting the framebuffer\n",
++				strerror(errno));
++			sTold = true;
++		}
++		if (drmModeSetCrtc(sFD, sCrtc, framebuffer, 0, 0, &sConnector, 1,
++				&sKMSMode) != 0)
++			return B_ERROR;
++		sShownHalf = half;
++		return B_OK;
++	}
++
++	// The flip's event comes through read() on the DRM file
++	drmEventContext context = {};
++	context.version = 2;
++	context.page_flip_handler = page_flip_done;
++	while (!done) {
++		if (drmHandleEvent(sFD, &context) != 0 && errno != EINTR) {
++			LOG("waiting for the page flip failed: %s\n", strerror(errno));
++			break;
++		}
++	}
++	sShownHalf = half;
++	return B_OK;
++}
++
++
++extern "C" void*
++get_accelerant_hook(uint32 feature, void* data)
++{
++	switch (feature) {
++		case B_INIT_ACCELERANT:
++			return (void*)amdgpu_kms_init_accelerant;
++		case B_UNINIT_ACCELERANT:
++			return (void*)amdgpu_kms_uninit_accelerant;
++		case B_CLONE_ACCELERANT:
++			return (void*)amdgpu_kms_clone_accelerant;
++		case B_ACCELERANT_CLONE_INFO_SIZE:
++			return (void*)amdgpu_kms_clone_info_size;
++		case B_GET_ACCELERANT_CLONE_INFO:
++			return (void*)amdgpu_kms_get_clone_info;
++		case B_GET_ACCELERANT_DEVICE_INFO:
++			return (void*)amdgpu_kms_get_device_info;
++		case B_ACCELERANT_RETRACE_SEMAPHORE:
++			return (void*)amdgpu_kms_retrace_semaphore;
++
++		case B_ACCELERANT_MODE_COUNT:
++			return (void*)amdgpu_kms_mode_count;
++		case B_GET_MODE_LIST:
++			return (void*)amdgpu_kms_get_mode_list;
++		case B_PROPOSE_DISPLAY_MODE:
++			return (void*)amdgpu_kms_propose_display_mode;
++		case B_SET_DISPLAY_MODE:
++			return (void*)amdgpu_kms_set_display_mode;
++		case B_GET_DISPLAY_MODE:
++			return (void*)amdgpu_kms_get_display_mode;
++		case B_GET_PREFERRED_DISPLAY_MODE:
++			return (void*)amdgpu_kms_get_preferred_display_mode;
++		case B_GET_EDID_INFO:
++			return (void*)amdgpu_kms_get_edid_info;
++		case B_GET_FRAME_BUFFER_CONFIG:
++			return (void*)amdgpu_kms_get_frame_buffer_config;
++		case B_GET_PIXEL_CLOCK_LIMITS:
++			return (void*)amdgpu_kms_get_pixel_clock_limits;
++
++		case B_MOVE_DISPLAY:
++			return (void*)amdgpu_kms_move_display;
++		case B_ACCELERANT_PAGE_FLIP_FEATURE:
++			return (void*)amdgpu_kms_move_display;
++
++		case B_SET_CURSOR_SHAPE:
++			return (void*)amdgpu_kms_set_cursor_shape;
++		case B_SET_CURSOR_BITMAP:
++			return (void*)amdgpu_kms_set_cursor_bitmap;
++		case B_MOVE_CURSOR:
++			return (void*)amdgpu_kms_move_cursor;
++		case B_SHOW_CURSOR:
++			return (void*)amdgpu_kms_show_cursor;
++	}
++	return NULL;
++}

@@ -1,0 +1,878 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 03:21:40 +0100
+Subject: [PATCH] haiku: libGL with BGLView on EGL
+
+A libGL.so.1 for Haiku's GL kit: BGLView renders into an EGL pbuffer
+(surfaceless platform) and SwapBuffers reads it back into a BBitmap that
+the view draws. The GL entry points come from libglapi_bridge, so
+existing BGLView programs run on any gallium driver EGL can open.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/haiku-gl/GLView.cpp  | 612 +++++++++++++++++++++++++++++++++++++++
+ src/haiku-gl/GLView.h    | 194 +++++++++++++
+ src/haiku-gl/meson.build |  17 ++
+ src/meson.build          |   5 +
+ 4 files changed, 828 insertions(+)
+ create mode 100644 src/haiku-gl/GLView.cpp
+ create mode 100644 src/haiku-gl/GLView.h
+ create mode 100644 src/haiku-gl/meson.build
+
+diff --git a/src/haiku-gl/GLView.cpp b/src/haiku-gl/GLView.cpp
+new file mode 100644
+index 0000000..5af84f0
+--- /dev/null
++++ b/src/haiku-gl/GLView.cpp
+@@ -0,0 +1,612 @@
++/*
++ * Copyright 2026, hans2294.
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * Haiku's GL kit (BGLView, with the ABI of GLView.h) on Mesa's EGL, so that
++ * existing BGLView programs render with whatever Gallium driver EGL finds:
++ * radeonsi on a linuxkpi DRM node, softpipe otherwise.
++ *
++ * The view's framebuffer is an EGL pbuffer of the view's size on the
++ * surfaceless platform, so the program's default framebuffer (FBO 0) is
++ * what it always was. SwapBuffers() reads it back into a BBitmap and draws
++ * that into the view.
++ *
++ * Locking: fDisplayLock is the GL lock (LockGL()/UnlockGL(), the context is
++ * current while it is held); fDrawLock guards the bitmap. Drawing into the
++ * view takes the window's looper lock first and fDrawLock second, from
++ * SwapBuffers() and from Draw() alike.
++ */
++
++#include "GLView.h"
++
++#include <Autolock.h>
++
++#include <new>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#include <GL/gl.h>
++
++#ifndef GL_BGRA
++#define GL_BGRA 0x80E1
++#endif
++
++
++struct glview_state {
++	EGLDisplay display;
++	EGLConfig config;
++	EGLContext context;
++	EGLSurface surface;
++	int32 width;			/* the view's, wanted for the next LockGL() */
++	int32 height;
++	int32 surfaceWidth;		/* the pbuffer's */
++	int32 surfaceHeight;
++	BBitmap* bitmap;		/* the last frame, B_RGB32 */
++	uint8* staging;			/* glReadPixels() lands here, bottom up */
++	size_t stagingSize;
++};
++
++
++static glview_state*
++state_of(void* gc)
++{
++	return (glview_state*)gc;
++}
++
++
++static glview_state*
++create_state(ulong options)
++{
++	glview_state* state = new(std::nothrow) glview_state;
++	if (state == NULL)
++		return NULL;
++	memset(state, 0, sizeof(*state));
++	state->surface = EGL_NO_SURFACE;
++	state->context = EGL_NO_CONTEXT;
++
++	state->display = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA,
++		EGL_DEFAULT_DISPLAY, NULL);
++	EGLint major, minor;
++	if (state->display == EGL_NO_DISPLAY
++		|| !eglInitialize(state->display, &major, &minor)) {
++		fprintf(stderr, "BGLView: no EGL display (error %#x)\n", eglGetError());
++		delete state;
++		return NULL;
++	}
++
++	const EGLint configAttributes[] = {
++		EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
++		EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
++		EGL_RED_SIZE, 8,
++		EGL_GREEN_SIZE, 8,
++		EGL_BLUE_SIZE, 8,
++		EGL_ALPHA_SIZE, (options & BGL_ALPHA) != 0 ? 8 : 0,
++		EGL_DEPTH_SIZE, (options & BGL_DEPTH) != 0 ? 24 : 0,
++		EGL_STENCIL_SIZE, (options & BGL_STENCIL) != 0 ? 8 : 0,
++		EGL_NONE
++	};
++	EGLint count = 0;
++	if (!eglChooseConfig(state->display, configAttributes, &state->config, 1,
++			&count) || count == 0) {
++		fprintf(stderr, "BGLView: no EGL config for options %#lx\n", options);
++		delete state;
++		return NULL;
++	}
++
++	// The compatibility profile, as BGLView programs expect it
++	eglBindAPI(EGL_OPENGL_API);
++	state->context = eglCreateContext(state->display, state->config,
++		EGL_NO_CONTEXT, NULL);
++	if (state->context == EGL_NO_CONTEXT) {
++		fprintf(stderr, "BGLView: no OpenGL context (error %#x)\n",
++			eglGetError());
++		delete state;
++		return NULL;
++	}
++	return state;
++}
++
++
++/*!	Makes the pbuffer match the view; the context must not be current. */
++static bool
++update_surface(glview_state* state)
++{
++	int32 width = state->width > 0 ? state->width : 1;
++	int32 height = state->height > 0 ? state->height : 1;
++	if (state->surface != EGL_NO_SURFACE && width == state->surfaceWidth
++		&& height == state->surfaceHeight)
++		return true;
++
++	if (state->surface != EGL_NO_SURFACE)
++		eglDestroySurface(state->display, state->surface);
++	const EGLint attributes[] = {
++		EGL_WIDTH, width,
++		EGL_HEIGHT, height,
++		EGL_NONE
++	};
++	state->surface = eglCreatePbufferSurface(state->display, state->config,
++		attributes);
++	if (state->surface == EGL_NO_SURFACE) {
++		fprintf(stderr, "BGLView: no %" B_PRId32 "x%" B_PRId32 " pbuffer "
++			"(error %#x)\n", width, height, eglGetError());
++		return false;
++	}
++	state->surfaceWidth = width;
++	state->surfaceHeight = height;
++	return true;
++}
++
++
++//	#pragma mark - BGLView
++
++
++BGLView::BGLView(BRect rect, const char* name, ulong resizingMode, ulong mode,
++	ulong options)
++	:
++	BView(rect, name, resizingMode, mode | B_WILL_DRAW | B_FRAME_EVENTS),
++	fGc(NULL),
++	fOptions(options),
++	fDitherCount(0),
++	fDrawLock("BGLView draw lock"),
++	fDisplayLock("BGLView display lock"),
++	fClipInfo(NULL),
++	fRenderer(NULL),
++	fRoster(NULL),
++	fDitherMap(NULL),
++	fBounds(rect)
++{
++	fErrorBuffer[0] = fErrorBuffer[1] = NULL;
++	// Every pixel comes from GL; app_server should not paint behind it.
++	SetViewColor(B_TRANSPARENT_COLOR);
++
++	glview_state* state = create_state(options);
++	if (state != NULL) {
++		state->width = rect.IntegerWidth() + 1;
++		state->height = rect.IntegerHeight() + 1;
++	}
++	fGc = state;
++}
++
++
++BGLView::BGLView(BRect rect, char* name, ulong resizingMode, ulong mode,
++	ulong options)
++	:
++	BGLView(rect, (const char*)name, resizingMode, mode, options)
++{
++}
++
++
++BGLView::~BGLView()
++{
++	glview_state* state = state_of(fGc);
++	if (state == NULL)
++		return;
++	// Other views of the team share the display; it stays initialized.
++	eglMakeCurrent(state->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
++		EGL_NO_CONTEXT);
++	if (state->surface != EGL_NO_SURFACE)
++		eglDestroySurface(state->display, state->surface);
++	eglDestroyContext(state->display, state->context);
++	delete state->bitmap;
++	free(state->staging);
++	delete state;
++}
++
++
++void
++BGLView::LockGL()
++{
++	fDisplayLock.Lock();
++	glview_state* state = state_of(fGc);
++	if (state == NULL || fDisplayLock.CountLocks() > 1)
++		return;
++
++	if (!update_surface(state))
++		return;
++	if (!eglMakeCurrent(state->display, state->surface, state->surface,
++			state->context))
++		fprintf(stderr, "BGLView: eglMakeCurrent failed (%#x)\n", eglGetError());
++}
++
++
++void
++BGLView::UnlockGL()
++{
++	glview_state* state = state_of(fGc);
++	if (state != NULL && fDisplayLock.CountLocks() == 1) {
++		// another thread may want the context next
++		eglMakeCurrent(state->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
++			EGL_NO_CONTEXT);
++	}
++	fDisplayLock.Unlock();
++}
++
++
++void
++BGLView::SwapBuffers()
++{
++	SwapBuffers(false);
++}
++
++
++void
++BGLView::SwapBuffers(bool vSync)
++{
++	glview_state* state = state_of(fGc);
++	if (state == NULL || state->surface == EGL_NO_SURFACE
++		|| eglGetCurrentContext() != state->context)
++		return;
++
++	int32 width = state->surfaceWidth;
++	int32 height = state->surfaceHeight;
++	size_t pitch = width * 4;
++	if (state->stagingSize < pitch * height) {
++		free(state->staging);
++		state->staging = (uint8*)malloc(pitch * height);
++		state->stagingSize = state->staging != NULL ? pitch * height : 0;
++		if (state->staging == NULL)
++			return;
++	}
++
++	// The back buffer for double buffered views, the front one otherwise
++	glReadBuffer((fOptions & BGL_DOUBLE) != 0 ? GL_BACK : GL_FRONT);
++	glPixelStorei(GL_PACK_ALIGNMENT, 4);
++	glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++	glReadPixels(0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE,
++		state->staging);
++
++	fDrawLock.Lock();
++	BBitmap* bitmap = state->bitmap;
++	if (bitmap == NULL || bitmap->Bounds().IntegerWidth() + 1 != width
++		|| bitmap->Bounds().IntegerHeight() + 1 != height) {
++		delete bitmap;
++		bitmap = new(std::nothrow) BBitmap(BRect(0, 0, width - 1, height - 1),
++			B_RGB32);
++		if (bitmap != NULL && bitmap->InitCheck() != B_OK) {
++			delete bitmap;
++			bitmap = NULL;
++		}
++		state->bitmap = bitmap;
++	}
++	if (bitmap != NULL) {
++		// GL's rows go bottom up
++		uint8* destination = (uint8*)bitmap->Bits();
++		int32 destinationPitch = bitmap->BytesPerRow();
++		for (int32 y = 0; y < height; y++) {
++			memcpy(destination + y * destinationPitch,
++				state->staging + (height - 1 - y) * pitch, pitch);
++		}
++	}
++	fDrawLock.Unlock();
++
++	if (bitmap != NULL && LockLooperWithTimeout(100000) == B_OK) {
++		fDrawLock.Lock();
++		if (state->bitmap != NULL)
++			DrawBitmap(state->bitmap, BPoint(0, 0));
++		fDrawLock.Unlock();
++		Flush();
++		UnlockLooper();
++	}
++}
++
++
++BView*
++BGLView::EmbeddedView()
++{
++	return NULL;
++}
++
++
++void*
++BGLView::GetGLProcAddress(const char* procName)
++{
++	return (void*)eglGetProcAddress(procName);
++}
++
++
++status_t
++BGLView::CopyPixelsOut(BPoint source, BBitmap* dest)
++{
++	glview_state* state = state_of(fGc);
++	if (state == NULL || dest == NULL || dest->ColorSpace() != B_RGB32)
++		return B_BAD_VALUE;
++
++	BAutolock _(fDrawLock);
++	BBitmap* bitmap = state->bitmap;
++	if (bitmap == NULL)
++		return B_ERROR;
++	BRect area = dest->Bounds().OffsetToCopy(source) & bitmap->Bounds();
++	if (!area.IsValid())
++		return B_BAD_VALUE;
++	for (int32 y = 0; y <= area.IntegerHeight(); y++) {
++		memcpy((uint8*)dest->Bits() + y * dest->BytesPerRow(),
++			(uint8*)bitmap->Bits() + ((int32)area.top + y) * bitmap->BytesPerRow()
++				+ (int32)area.left * 4,
++			(area.IntegerWidth() + 1) * 4);
++	}
++	return B_OK;
++}
++
++
++status_t
++BGLView::CopyPixelsIn(BBitmap* source, BPoint dest)
++{
++	return B_UNSUPPORTED;
++}
++
++
++void
++BGLView::ErrorCallback(unsigned long errorCode)
++{
++	fprintf(stderr, "BGLView: GL error %#lx\n", errorCode);
++}
++
++
++void
++BGLView::Draw(BRect updateRect)
++{
++	glview_state* state = state_of(fGc);
++	if (state == NULL)
++		return;
++	BAutolock _(fDrawLock);
++	if (state->bitmap != NULL)
++		DrawBitmap(state->bitmap, BPoint(0, 0));
++}
++
++
++void
++BGLView::AttachedToWindow()
++{
++	BView::AttachedToWindow();
++	glview_state* state = state_of(fGc);
++	if (state != NULL) {
++		state->width = Bounds().IntegerWidth() + 1;
++		state->height = Bounds().IntegerHeight() + 1;
++	}
++}
++
++
++void
++BGLView::AllAttached()
++{
++	BView::AllAttached();
++}
++
++
++void
++BGLView::DetachedFromWindow()
++{
++	BView::DetachedFromWindow();
++}
++
++
++void
++BGLView::AllDetached()
++{
++	BView::AllDetached();
++}
++
++
++void
++BGLView::FrameResized(float newWidth, float newHeight)
++{
++	// The next LockGL() makes the pbuffer this size.
++	glview_state* state = state_of(fGc);
++	if (state != NULL) {
++		state->width = (int32)newWidth + 1;
++		state->height = (int32)newHeight + 1;
++	}
++	fBounds = Bounds();
++	BView::FrameResized(newWidth, newHeight);
++}
++
++
++status_t
++BGLView::Perform(perform_code d, void* arg)
++{
++	return BView::Perform(d, arg);
++}
++
++
++status_t
++BGLView::Archive(BMessage* data, bool deep) const
++{
++	return BView::Archive(data, deep);
++}
++
++
++void
++BGLView::MessageReceived(BMessage* message)
++{
++	BView::MessageReceived(message);
++}
++
++
++void
++BGLView::SetResizingMode(uint32 mode)
++{
++	BView::SetResizingMode(mode);
++}
++
++
++void
++BGLView::Show()
++{
++	BView::Show();
++}
++
++
++void
++BGLView::Hide()
++{
++	BView::Hide();
++}
++
++
++BHandler*
++BGLView::ResolveSpecifier(BMessage* msg, int32 index, BMessage* specifier,
++	int32 form, const char* property)
++{
++	return BView::ResolveSpecifier(msg, index, specifier, form, property);
++}
++
++
++status_t
++BGLView::GetSupportedSuites(BMessage* data)
++{
++	return BView::GetSupportedSuites(data);
++}
++
++
++void
++BGLView::DirectConnected(direct_buffer_info* info)
++{
++	// Frames always go through a bitmap.
++}
++
++
++void
++BGLView::EnableDirectMode(bool enabled)
++{
++}
++
++
++void
++BGLView::GetPreferredSize(float* width, float* height)
++{
++	if (width != NULL)
++		*width = 0;
++	if (height != NULL)
++		*height = 0;
++}
++
++
++void BGLView::_ReservedGLView1() {}
++void BGLView::_ReservedGLView2() {}
++void BGLView::_ReservedGLView3() {}
++void BGLView::_ReservedGLView4() {}
++void BGLView::_ReservedGLView5() {}
++void BGLView::_ReservedGLView6() {}
++void BGLView::_ReservedGLView7() {}
++void BGLView::_ReservedGLView8() {}
++
++
++void
++BGLView::_LockDraw()
++{
++	fDrawLock.Lock();
++}
++
++
++void
++BGLView::_UnlockDraw()
++{
++	fDrawLock.Unlock();
++}
++
++
++void
++BGLView::_CallDirectConnected()
++{
++}
++
++
++//	#pragma mark - BGLScreen
++
++
++/*	Full screen GL needs the screen's frame buffer, which no Mesa driver here
++	draws into; BGLScreen exists so its users load, and fails cleanly.
++*/
++BGLScreen::BGLScreen(char* name, ulong screenMode, ulong options,
++	status_t* error, bool debug)
++	:
++	BWindowScreen(name, screenMode, error, debug),
++	fGc(NULL),
++	fOptions(options),
++	fDrawLock("BGLScreen draw lock"),
++	fColorSpace(B_CMAP8),
++	fScreenMode(screenMode)
++{
++	if (error != NULL)
++		*error = B_UNSUPPORTED;
++}
++
++
++BGLScreen::~BGLScreen()
++{
++}
++
++
++void BGLScreen::LockGL() { fDrawLock.Lock(); }
++void BGLScreen::UnlockGL() { fDrawLock.Unlock(); }
++void BGLScreen::SwapBuffers() {}
++void BGLScreen::ErrorCallback(unsigned long errorCode) {}
++
++void
++BGLScreen::ScreenConnected(bool connected)
++{
++}
++
++
++void
++BGLScreen::FrameResized(float width, float height)
++{
++	BWindowScreen::FrameResized(width, height);
++}
++
++
++status_t
++BGLScreen::Perform(perform_code code, void* arg)
++{
++	// BWindowScreen keeps its Perform() private
++	return BWindow::Perform(code, arg);
++}
++
++
++status_t
++BGLScreen::Archive(BMessage* data, bool deep) const
++{
++	return BWindowScreen::Archive(data, deep);
++}
++
++
++void
++BGLScreen::MessageReceived(BMessage* message)
++{
++	BWindowScreen::MessageReceived(message);
++}
++
++
++void BGLScreen::Show() { BWindowScreen::Show(); }
++void BGLScreen::Hide() { BWindowScreen::Hide(); }
++
++
++BHandler*
++BGLScreen::ResolveSpecifier(BMessage* message, int32 index,
++	BMessage* specifier, int32 form, const char* property)
++{
++	return BWindowScreen::ResolveSpecifier(message, index, specifier, form,
++		property);
++}
++
++
++status_t
++BGLScreen::GetSupportedSuites(BMessage* data)
++{
++	return BWindowScreen::GetSupportedSuites(data);
++}
++
++
++void BGLScreen::_ReservedGLScreen1() {}
++void BGLScreen::_ReservedGLScreen2() {}
++void BGLScreen::_ReservedGLScreen3() {}
++void BGLScreen::_ReservedGLScreen4() {}
++void BGLScreen::_ReservedGLScreen5() {}
++void BGLScreen::_ReservedGLScreen6() {}
++void BGLScreen::_ReservedGLScreen7() {}
++void BGLScreen::_ReservedGLScreen8() {}
+diff --git a/src/haiku-gl/GLView.h b/src/haiku-gl/GLView.h
+new file mode 100644
+index 0000000..e733377
+--- /dev/null
++++ b/src/haiku-gl/GLView.h
+@@ -0,0 +1,194 @@
++/*
++ * Copyright 2008-2013, Haiku, Inc. All Rights Reserved.
++ * Distributed under the terms of the MIT License.
++ *
++ * This header defines BGLView, the base class making up
++ * the Haiku GL Kit.
++ *
++ */
++#ifndef BGLVIEW_H
++#define BGLVIEW_H
++
++
++#include <GL/gl.h>
++
++#define BGL_RGB				0
++#define BGL_INDEX			1
++#define BGL_SINGLE			0
++#define BGL_DOUBLE			2
++#define BGL_DIRECT			0
++#define BGL_INDIRECT		4
++#define BGL_ACCUM			8
++#define BGL_ALPHA			16
++#define BGL_DEPTH			32
++#define BGL_OVERLAY			64
++#define BGL_UNDERLAY		128
++#define BGL_STENCIL			512
++#define BGL_SHARE_CONTEXT	1024
++
++#ifdef __cplusplus
++
++#include <AppKit.h>
++#include <Bitmap.h>
++#include <DirectWindow.h>
++#include <View.h>
++#include <Window.h>
++#include <WindowScreen.h>
++
++
++struct glview_direct_info;
++class BGLRenderer;
++class GLRendererRoster;
++
++class _EXPORT BGLView : public BView {
++public:
++							BGLView(BRect rect, const char* name,
++								ulong resizingMode, ulong mode,
++								ulong options);
++	virtual					~BGLView();
++
++			void			LockGL();
++			void			UnlockGL();
++			void			SwapBuffers();
++			void			SwapBuffers(bool vSync);
++
++			BView*			EmbeddedView(); // deprecated, returns NULL
++			void*			GetGLProcAddress(const char* procName);
++
++			status_t		CopyPixelsOut(BPoint source, BBitmap *dest);
++			status_t		CopyPixelsIn(BBitmap *source, BPoint dest);
++
++	// Mesa's GLenum is uint where Be's ones was ulong!
++	virtual	void			ErrorCallback(unsigned long errorCode);
++
++	virtual void			Draw(BRect updateRect);
++	virtual void			AttachedToWindow();
++	virtual void			AllAttached();
++	virtual void			DetachedFromWindow();
++	virtual void			AllDetached();
++
++	virtual void			FrameResized(float newWidth, float newHeight);
++	virtual status_t		Perform(perform_code d, void *arg);
++
++	virtual status_t		Archive(BMessage *data, bool deep = true) const;
++
++	virtual void			MessageReceived(BMessage *message);
++	virtual void			SetResizingMode(uint32 mode);
++
++	virtual void			Show();
++	virtual void			Hide();
++
++	virtual BHandler*		ResolveSpecifier(BMessage *msg, int32 index,
++								BMessage *specifier, int32 form,
++								const char *property);
++	virtual status_t		GetSupportedSuites(BMessage *data);
++
++			void			DirectConnected(direct_buffer_info *info);
++			void			EnableDirectMode(bool enabled);
++
++			void*			getGC()	{ return fGc; } // ???
++
++	virtual void			GetPreferredSize(float* width, float* height);
++
++private:
++
++	virtual void			_ReservedGLView1();
++	virtual void			_ReservedGLView2();
++	virtual void			_ReservedGLView3();
++	virtual void			_ReservedGLView4();
++	virtual void			_ReservedGLView5();
++	virtual void			_ReservedGLView6();
++	virtual void			_ReservedGLView7();
++	virtual void			_ReservedGLView8();
++
++							BGLView(const BGLView &);
++							BGLView &operator=(const BGLView &);
++
++			void			_DitherFront();
++			bool			_ConfirmDither();
++			void			_Draw(BRect rect);
++			void			_CallDirectConnected();
++
++			void*			fGc;
++			uint32			fOptions;
++			uint32			fDitherCount;
++			BLocker			fDrawLock;
++			BLocker			fDisplayLock;
++			glview_direct_info* fClipInfo;
++
++			BGLRenderer*	fRenderer;
++			GLRendererRoster* fRoster;
++
++			BBitmap*		fDitherMap;
++			BRect			fBounds;
++			int16*			fErrorBuffer[2];
++			uint64			_reserved[8];
++
++			void			_LockDraw();
++			void			_UnlockDraw();
++
++// BeOS compatibility
++private:
++							BGLView(BRect rect, char* name,
++								ulong resizingMode, ulong mode,
++								ulong options);
++};
++
++
++class BGLScreen : public BWindowScreen {
++public:
++							BGLScreen(char* name,
++								ulong screenMode, ulong options,
++								status_t *error, bool debug=false);
++							~BGLScreen();
++
++			void			LockGL();
++			void			UnlockGL();
++			void			SwapBuffers();
++							// Mesa's GLenum is uint where Be's ones was ulong!
++	virtual	void			ErrorCallback(unsigned long errorCode);
++
++	virtual void			ScreenConnected(bool connected);
++	virtual void			FrameResized(float width, float height);
++	virtual status_t		Perform(perform_code code, void *arg);
++
++	virtual status_t		Archive(BMessage *data, bool deep = true) const;
++	virtual void			MessageReceived(BMessage *message);
++
++	virtual void			Show();
++	virtual void			Hide();
++
++	virtual BHandler*		ResolveSpecifier(BMessage *message,
++								int32 index,
++								BMessage *specifier,
++								int32 form,
++								const char *property);
++	virtual status_t		GetSupportedSuites(BMessage *data);
++
++private:
++
++	virtual void			_ReservedGLScreen1();
++	virtual void			_ReservedGLScreen2();
++	virtual void			_ReservedGLScreen3();
++	virtual void			_ReservedGLScreen4();
++	virtual void			_ReservedGLScreen5();
++	virtual void			_ReservedGLScreen6();
++	virtual void			_ReservedGLScreen7();
++	virtual void			_ReservedGLScreen8();
++
++							BGLScreen(const BGLScreen &);
++							BGLScreen &operator=(const BGLScreen &);
++
++			void*			fGc;
++			long			fOptions;
++			BLocker			fDrawLock;
++
++			int32			fColorSpace;
++			uint32			fScreenMode;
++
++			uint64			_reserved[7];
++};
++
++#endif // __cplusplus
++
++#endif // BGLVIEW_H
+diff --git a/src/haiku-gl/meson.build b/src/haiku-gl/meson.build
+new file mode 100644
+index 0000000..e77163c
+--- /dev/null
++++ b/src/haiku-gl/meson.build
+@@ -0,0 +1,17 @@
++# Copyright 2026, hans2294.
++# SPDX-License-Identifier: MIT
++
++# Haiku's GL kit (libGL.so.1 with BGLView) on Mesa's EGL: the GL entry
++# points from glapi's bridge, dispatching through libgallium's glapi.
++libgl_haiku = shared_library(
++  'GL',
++  files('GLView.cpp'),
++  link_whole : libglapi_bridge,
++  link_with : [shared_glapi_lib, libegl],
++  include_directories : [inc_include, inc_src, include_directories('.')],
++  dependencies : [cpp.find_library('be'), cpp.find_library('game'), dep_thread],
++  link_args : [ld_args_bsymbolic, ld_args_gc_sections],
++  soversion : '1',
++  version : '1.0.0',
++  install : true,
++)
+diff --git a/src/meson.build b/src/meson.build
+index c36f44b..f234ffb 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -160,6 +160,11 @@ endif
+ if with_egl
+   subdir('egl')
+ endif
++
++# Haiku's GL kit (BGLView) on EGL
++if host_machine.system() == 'haiku' and with_egl and with_opengl
++  subdir('haiku-gl')
++endif
+ if with_gallium
+   if with_glx == 'dri' or with_platform_x11
+     subdir('gallium/targets/dril')

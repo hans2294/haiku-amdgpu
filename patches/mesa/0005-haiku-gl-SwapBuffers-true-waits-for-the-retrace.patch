@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 09:45:08 +0100
+Subject: [PATCH] haiku-gl: SwapBuffers(true) waits for the retrace
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/haiku-gl/GLView.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/haiku-gl/GLView.cpp b/src/haiku-gl/GLView.cpp
+index 5af84f0..e24d0e2 100644
+--- a/src/haiku-gl/GLView.cpp
++++ b/src/haiku-gl/GLView.cpp
+@@ -22,6 +22,7 @@
+ #include "GLView.h"
+ 
+ #include <Autolock.h>
++#include <Screen.h>
+ 
+ #include <new>
+ #include <stdio.h>
+@@ -284,6 +285,11 @@ BGLView::SwapBuffers(bool vSync)
+ 	}
+ 	fDrawLock.Unlock();
+ 
++	// With vSync the picture goes to app_server right after a vblank, so it
++	// lands early in the next frame, and the frame rate follows the display.
++	if (vSync && bitmap != NULL)
++		BScreen(Window()).WaitForRetrace(100000);
++
+ 	if (bitmap != NULL && LockLooperWithTimeout(100000) == B_OK) {
+ 		fDrawLock.Lock();
+ 		if (state->bitmap != NULL)

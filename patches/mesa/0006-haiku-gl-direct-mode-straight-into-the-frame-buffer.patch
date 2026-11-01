@@ -1,0 +1,491 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 10:06:53 +0100
+Subject: [PATCH] haiku-gl: direct mode straight into the frame buffer
+
+A BGLView in a BDirectWindow imports the CRTC's scanout buffer as an
+EGLImage through a dma-buf and blits each frame into it on the GPU,
+clipped to what DirectConnected() reports. Also: dmabuf caps on Haiku,
+and WSI implicit sync only for images that have a dma-buf.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/gallium/auxiliary/util/u_screen.c |   2 +-
+ src/haiku-gl/GLView.cpp               | 322 +++++++++++++++++++++++++-
+ src/haiku-gl/meson.build              |   2 +-
+ src/vulkan/wsi/wsi_common_drm.c       |   6 +
+ 4 files changed, 322 insertions(+), 10 deletions(-)
+
+diff --git a/src/gallium/auxiliary/util/u_screen.c b/src/gallium/auxiliary/util/u_screen.c
+index da9cdfc..1e0940b 100644
+--- a/src/gallium/auxiliary/util/u_screen.c
++++ b/src/gallium/auxiliary/util/u_screen.c
+@@ -132,7 +132,7 @@ u_init_pipe_screen_caps(struct pipe_screen *pscreen, int accel)
+ 
+    caps->throttle = true;
+ 
+-#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_MANAGARM)
++#if defined(HAVE_LIBDRM) && (DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_MANAGARM || DETECT_OS_HAIKU)
+    if (pscreen->get_screen_fd) {
+       uint64_t cap;
+       int fd = pscreen->get_screen_fd(pscreen);
+diff --git a/src/haiku-gl/GLView.cpp b/src/haiku-gl/GLView.cpp
+index e24d0e2..b230ccd 100644
+--- a/src/haiku-gl/GLView.cpp
++++ b/src/haiku-gl/GLView.cpp
+@@ -13,25 +13,43 @@
+  * what it always was. SwapBuffers() reads it back into a BBitmap and draws
+  * that into the view.
+  *
++ * In direct mode (a BDirectWindow that called EnableDirectMode()), frames
++ * skip the CPU: the screen's frame buffer, the CRTC's scanout buffer on the
++ * DRM primary node, is imported as an EGLImage through a dma-buf, and
++ * SwapBuffers() blits the pbuffer into it on the GPU, clipped to the
++ * visible parts of the view that DirectConnected() reported. It finishes
++ * the blit before it lets go of fDrawLock, so a B_DIRECT_STOP (which takes
++ * that lock) returns only once nothing more lands in the frame buffer.
++ *
+  * Locking: fDisplayLock is the GL lock (LockGL()/UnlockGL(), the context is
+- * current while it is held); fDrawLock guards the bitmap. Drawing into the
+- * view takes the window's looper lock first and fDrawLock second, from
+- * SwapBuffers() and from Draw() alike.
++ * current while it is held); fDrawLock guards the bitmap and the direct
++ * mode state. Drawing into the view takes the window's looper lock first
++ * and fDrawLock second, from SwapBuffers() and from Draw() alike.
+  */
+ 
++// GLView.h brings GL/gl.h, and with it glext.h
++#define GL_GLEXT_PROTOTYPES
+ #include "GLView.h"
+ 
+ #include <Autolock.h>
++#include <DirectWindow.h>
+ #include <Screen.h>
+ 
++#include <fcntl.h>
+ #include <new>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <unistd.h>
+ 
+ #include <EGL/egl.h>
+ #include <EGL/eglext.h>
+ #include <GL/gl.h>
++#include <GL/glext.h>
++
++#include <drm_fourcc.h>
++#include <xf86drm.h>
++#include <xf86drmMode.h>
+ 
+ #ifndef GL_BGRA
+ #define GL_BGRA 0x80E1
+@@ -47,9 +65,28 @@ struct glview_state {
+ 	int32 height;
+ 	int32 surfaceWidth;		/* the pbuffer's */
+ 	int32 surfaceHeight;
+-	BBitmap* bitmap;		/* the last frame, B_RGB32 */
++	BBitmap* bitmap;		/* the last frame (not in direct mode), B_RGB32 */
+ 	uint8* staging;			/* glReadPixels() lands here, bottom up */
+ 	size_t stagingSize;
++
++	/* direct mode, under fDrawLock */
++	bool directEnabled;		/* EnableDirectMode(true) */
++	bool directConnected;	/* between B_DIRECT_START and B_DIRECT_STOP */
++	bool directFailed;		/* the frame buffer could not be imported */
++	bool screenChanged;		/* import the frame buffer again */
++	void* screenBits;		/* as DirectConnected() saw it last */
++	clipping_rect windowBounds;	/* the window's content on screen */
++	clipping_rect viewBounds;	/* the view on screen, inclusive */
++	clipping_rect* clipList;	/* visible parts of the window, on screen */
++	uint32 clipCount;
++	uint32 clipCapacity;
++	BPoint viewOffset;		/* the view's origin in the window */
++
++	/* the frame buffer as a GL framebuffer; GL thread only */
++	int primaryFD;
++	EGLImage screenImage;
++	GLuint screenRenderbuffer;
++	GLuint screenFramebuffer;
+ };
+ 
+ 
+@@ -63,12 +100,13 @@ state_of(void* gc)
+ static glview_state*
+ create_state(ulong options)
+ {
+-	glview_state* state = new(std::nothrow) glview_state;
++	glview_state* state = new(std::nothrow) glview_state();
+ 	if (state == NULL)
+ 		return NULL;
+-	memset(state, 0, sizeof(*state));
+ 	state->surface = EGL_NO_SURFACE;
+ 	state->context = EGL_NO_CONTEXT;
++	state->primaryFD = -1;
++	state->screenImage = EGL_NO_IMAGE;
+ 
+ 	state->display = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA,
+ 		EGL_DEFAULT_DISPLAY, NULL);
+@@ -143,6 +181,180 @@ update_surface(glview_state* state)
+ }
+ 
+ 
++//	#pragma mark - direct mode
++
++
++/*!	Drops the imported frame buffer; the context must be current. */
++static void
++release_screen(glview_state* state)
++{
++	if (state->screenFramebuffer != 0)
++		glDeleteFramebuffers(1, &state->screenFramebuffer);
++	if (state->screenRenderbuffer != 0)
++		glDeleteRenderbuffers(1, &state->screenRenderbuffer);
++	if (state->screenImage != EGL_NO_IMAGE)
++		eglDestroyImage(state->display, state->screenImage);
++	state->screenFramebuffer = 0;
++	state->screenRenderbuffer = 0;
++	state->screenImage = EGL_NO_IMAGE;
++}
++
++
++/*!	Imports the frame buffer the CRTC shows as a GL framebuffer: its handle
++	comes from the primary node (which needs no master for that here), it
++	travels as a dma-buf, and becomes an EGLImage behind a renderbuffer.
++	The context must be current.
++*/
++static bool
++import_screen(glview_state* state)
++{
++	typedef void (*image_target_renderbuffer)(GLenum, GLeglImageOES);
++	static image_target_renderbuffer sImageTargetRenderbuffer
++		= (image_target_renderbuffer)eglGetProcAddress(
++			"glEGLImageTargetRenderbufferStorageOES");
++	if (sImageTargetRenderbuffer == NULL)
++		return false;
++
++	if (state->primaryFD < 0)
++		state->primaryFD = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
++	int fd = state->primaryFD;
++	if (fd < 0)
++		return false;
++
++	uint32 framebufferID = 0;
++	drmModeResPtr resources = drmModeGetResources(fd);
++	for (int i = 0; resources != NULL && i < resources->count_crtcs
++			&& framebufferID == 0; i++) {
++		drmModeCrtcPtr crtc = drmModeGetCrtc(fd, resources->crtcs[i]);
++		if (crtc != NULL)
++			framebufferID = crtc->buffer_id;
++		drmModeFreeCrtc(crtc);
++	}
++	drmModeFreeResources(resources);
++
++	drmModeFBPtr framebuffer = framebufferID != 0
++		? drmModeGetFB(fd, framebufferID) : NULL;
++	if (framebuffer == NULL || framebuffer->handle == 0
++		|| framebuffer->bpp != 32) {
++		drmModeFreeFB(framebuffer);
++		return false;
++	}
++	int dmaBuf = -1;
++	int result = drmPrimeHandleToFD(fd, framebuffer->handle, DRM_CLOEXEC,
++		&dmaBuf);
++	drmCloseBufferHandle(fd, framebuffer->handle);
++	if (result != 0) {
++		drmModeFreeFB(framebuffer);
++		return false;
++	}
++
++	const EGLAttrib attributes[] = {
++		EGL_WIDTH, (EGLAttrib)framebuffer->width,
++		EGL_HEIGHT, (EGLAttrib)framebuffer->height,
++		EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_XRGB8888,
++		EGL_DMA_BUF_PLANE0_FD_EXT, dmaBuf,
++		EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
++		EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLAttrib)framebuffer->pitch,
++		EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
++			(EGLAttrib)(DRM_FORMAT_MOD_LINEAR & 0xffffffff),
++		EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
++			(EGLAttrib)(DRM_FORMAT_MOD_LINEAR >> 32),
++		EGL_NONE
++	};
++	drmModeFreeFB(framebuffer);
++	state->screenImage = eglCreateImage(state->display, EGL_NO_CONTEXT,
++		EGL_LINUX_DMA_BUF_EXT, NULL, attributes);
++	close(dmaBuf);
++	if (state->screenImage == EGL_NO_IMAGE) {
++		fprintf(stderr, "BGLView: importing the frame buffer failed (%#x)\n",
++			eglGetError());
++		return false;
++	}
++
++	GLint renderbuffer, drawFramebuffer;
++	glGetIntegerv(GL_RENDERBUFFER_BINDING, &renderbuffer);
++	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFramebuffer);
++	glGenRenderbuffers(1, &state->screenRenderbuffer);
++	glBindRenderbuffer(GL_RENDERBUFFER, state->screenRenderbuffer);
++	sImageTargetRenderbuffer(GL_RENDERBUFFER, state->screenImage);
++	glGenFramebuffers(1, &state->screenFramebuffer);
++	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, state->screenFramebuffer);
++	glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++		GL_RENDERBUFFER, state->screenRenderbuffer);
++	GLenum status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
++	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, drawFramebuffer);
++	glBindRenderbuffer(GL_RENDERBUFFER, renderbuffer);
++	if (status != GL_FRAMEBUFFER_COMPLETE) {
++		fprintf(stderr, "BGLView: frame buffer incomplete (%#x)\n", status);
++		release_screen(state);
++		return false;
++	}
++	return true;
++}
++
++
++/*!	Blits the frame into the frame buffer, clipped to the visible parts of
++	the view, and waits until it is there. The program's GL state is left
++	as it was. The context must be current, and fDrawLock held.
++*/
++static void
++blit_to_screen(glview_state* state, bool doubleBuffered)
++{
++	GLint readFramebuffer, drawFramebuffer, readBuffer, scissorBox[4];
++	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFramebuffer);
++	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFramebuffer);
++	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
++	glGetIntegerv(GL_READ_BUFFER, &readBuffer);
++	glGetIntegerv(GL_SCISSOR_BOX, scissorBox);
++	GLboolean scissorTest = glIsEnabled(GL_SCISSOR_TEST);
++	GLboolean srgb = glIsEnabled(GL_FRAMEBUFFER_SRGB);
++
++	glReadBuffer(doubleBuffered ? GL_BACK : GL_FRONT);
++	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, state->screenFramebuffer);
++	glDisable(GL_FRAMEBUFFER_SRGB);
++	glEnable(GL_SCISSOR_TEST);
++
++	// The frame buffer's rows go top down in GL's terms, the pbuffer's
++	// bottom up: the blit flips.
++	const clipping_rect& view = state->viewBounds;
++	int32 width = state->surfaceWidth;
++	int32 height = state->surfaceHeight;
++	for (uint32 i = 0; i < state->clipCount; i++) {
++		const clipping_rect& clip = state->clipList[i];
++		int32 left = max_c(clip.left, view.left);
++		int32 top = max_c(clip.top, view.top);
++		int32 right = min_c(clip.right, view.right);
++		int32 bottom = min_c(clip.bottom, view.bottom);
++		if (left > right || top > bottom)
++			continue;
++		glScissor(left, top, right - left + 1, bottom - top + 1);
++		glBlitFramebuffer(0, 0, width, height, view.left, view.top + height,
++			view.left + width, view.top, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++	}
++	glFinish();
++
++	glScissor(scissorBox[0], scissorBox[1], scissorBox[2], scissorBox[3]);
++	if (!scissorTest)
++		glDisable(GL_SCISSOR_TEST);
++	if (srgb)
++		glEnable(GL_FRAMEBUFFER_SRGB);
++	glReadBuffer(readBuffer);
++	glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebuffer);
++	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, drawFramebuffer);
++}
++
++
++/*!	The view's origin in its window; the looper must be locked. */
++static BPoint
++view_offset(BView* view)
++{
++	BWindow* window = view->Window();
++	if (window == NULL)
++		return B_ORIGIN;
++	return view->ConvertToScreen(B_ORIGIN) - window->ConvertToScreen(B_ORIGIN);
++}
++
++
+ //	#pragma mark - BGLView
+ 
+ 
+@@ -192,9 +404,15 @@ BGLView::~BGLView()
+ 		EGL_NO_CONTEXT);
+ 	if (state->surface != EGL_NO_SURFACE)
+ 		eglDestroySurface(state->display, state->surface);
++	// the frame buffer's GL objects go with the context
++	if (state->screenImage != EGL_NO_IMAGE)
++		eglDestroyImage(state->display, state->screenImage);
+ 	eglDestroyContext(state->display, state->context);
++	if (state->primaryFD >= 0)
++		close(state->primaryFD);
+ 	delete state->bitmap;
+ 	free(state->staging);
++	free(state->clipList);
+ 	delete state;
+ }
+ 
+@@ -243,6 +461,41 @@ BGLView::SwapBuffers(bool vSync)
+ 		|| eglGetCurrentContext() != state->context)
+ 		return;
+ 
++	// Direct mode: straight into the frame buffer on the GPU. The vblank
++	// wait comes first, as B_DIRECT_STOP must not wait for it.
++	if (state->directEnabled && state->directConnected
++		&& !state->directFailed) {
++		if (vSync)
++			BScreen(Window()).WaitForRetrace(100000);
++		BAutolock _(fDrawLock);
++		if (state->directConnected && state->screenChanged) {
++			release_screen(state);
++			state->screenChanged = false;
++			static bool sTold;
++			if (!import_screen(state)) {
++				fprintf(stderr, "BGLView: no direct mode, frames go through "
++					"a bitmap\n");
++				state->directFailed = true;
++			} else if (!sTold) {
++				fprintf(stderr, "BGLView: direct mode, frames go straight to "
++					"the frame buffer\n");
++				sTold = true;
++			}
++		}
++		if (state->directConnected && state->screenFramebuffer != 0) {
++			state->viewBounds.left = state->windowBounds.left
++				+ (int32)state->viewOffset.x;
++			state->viewBounds.top = state->windowBounds.top
++				+ (int32)state->viewOffset.y;
++			state->viewBounds.right = state->viewBounds.left
++				+ state->surfaceWidth - 1;
++			state->viewBounds.bottom = state->viewBounds.top
++				+ state->surfaceHeight - 1;
++			blit_to_screen(state, (fOptions & BGL_DOUBLE) != 0);
++			return;
++		}
++	}
++
+ 	int32 width = state->surfaceWidth;
+ 	int32 height = state->surfaceHeight;
+ 	size_t pitch = width * 4;
+@@ -360,7 +613,11 @@ BGLView::Draw(BRect updateRect)
+ 	if (state == NULL)
+ 		return;
+ 	BAutolock _(fDrawLock);
+-	if (state->bitmap != NULL)
++	state->viewOffset = view_offset(this);
++	// In direct mode the next frame goes to the screen; the bitmap is old.
++	if (state->bitmap != NULL
++		&& !(state->directEnabled && state->directConnected
++			&& !state->directFailed))
+ 		DrawBitmap(state->bitmap, BPoint(0, 0));
+ }
+ 
+@@ -373,6 +630,8 @@ BGLView::AttachedToWindow()
+ 	if (state != NULL) {
+ 		state->width = Bounds().IntegerWidth() + 1;
+ 		state->height = Bounds().IntegerHeight() + 1;
++		BAutolock _(fDrawLock);
++		state->viewOffset = view_offset(this);
+ 	}
+ }
+ 
+@@ -406,6 +665,8 @@ BGLView::FrameResized(float newWidth, float newHeight)
+ 	if (state != NULL) {
+ 		state->width = (int32)newWidth + 1;
+ 		state->height = (int32)newHeight + 1;
++		BAutolock _(fDrawLock);
++		state->viewOffset = view_offset(this);
+ 	}
+ 	fBounds = Bounds();
+ 	BView::FrameResized(newWidth, newHeight);
+@@ -469,16 +730,61 @@ BGLView::GetSupportedSuites(BMessage* data)
+ }
+ 
+ 
++/*!	Called by the BDirectWindow (from its direct daemon) with where the
++	window is and which parts of it show. Frames go to the screen from
++	B_DIRECT_START until B_DIRECT_STOP; that one returns only after the
++	last frame's blit is done (SwapBuffers() holds fDrawLock until then).
++*/
+ void
+ BGLView::DirectConnected(direct_buffer_info* info)
+ {
+-	// Frames always go through a bitmap.
++	glview_state* state = state_of(fGc);
++	if (state == NULL || info == NULL)
++		return;
++
++	BAutolock _(fDrawLock);
++	switch (info->buffer_state & B_DIRECT_MODE_MASK) {
++		case B_DIRECT_START:
++		case B_DIRECT_MODIFY:
++		{
++			if (info->clip_list_count > state->clipCapacity) {
++				clipping_rect* list = (clipping_rect*)realloc(state->clipList,
++					info->clip_list_count * sizeof(clipping_rect));
++				if (list == NULL) {
++					state->directConnected = false;
++					return;
++				}
++				state->clipList = list;
++				state->clipCapacity = info->clip_list_count;
++			}
++			memcpy(state->clipList, info->clip_list,
++				info->clip_list_count * sizeof(clipping_rect));
++			state->clipCount = info->clip_list_count;
++			state->windowBounds = info->window_bounds;
++			if (info->bits != state->screenBits
++				|| (info->buffer_state & B_BUFFER_RESET) != 0
++				|| state->screenFramebuffer == 0) {
++				state->screenBits = info->bits;
++				state->screenChanged = true;
++			}
++			state->directConnected = true;
++			break;
++		}
++		case B_DIRECT_STOP:
++			state->directConnected = false;
++			break;
++	}
+ }
+ 
+ 
+ void
+ BGLView::EnableDirectMode(bool enabled)
+ {
++	glview_state* state = state_of(fGc);
++	if (state == NULL)
++		return;
++	BAutolock _(fDrawLock);
++	state->directEnabled = enabled;
+ }
+ 
+ 
+diff --git a/src/haiku-gl/meson.build b/src/haiku-gl/meson.build
+index e77163c..3a37e05 100644
+--- a/src/haiku-gl/meson.build
++++ b/src/haiku-gl/meson.build
+@@ -9,7 +9,7 @@ libgl_haiku = shared_library(
+   link_whole : libglapi_bridge,
+   link_with : [shared_glapi_lib, libegl],
+   include_directories : [inc_include, inc_src, include_directories('.')],
+-  dependencies : [cpp.find_library('be'), cpp.find_library('game'), dep_thread],
++  dependencies : [cpp.find_library('be'), cpp.find_library('game'), dep_thread, dep_libdrm],
+   link_args : [ld_args_bsymbolic, ld_args_gc_sections],
+   soversion : '1',
+   version : '1.0.0',
+diff --git a/src/vulkan/wsi/wsi_common_drm.c b/src/vulkan/wsi/wsi_common_drm.c
+index dbf65b2..00a68ed 100644
+--- a/src/vulkan/wsi/wsi_common_drm.c
++++ b/src/vulkan/wsi/wsi_common_drm.c
+@@ -373,6 +373,12 @@ wsi_drm_init_swapchain_implicit_sync(struct wsi_swapchain *chain)
+    if (chain->image_info.explicit_sync)
+       return VK_SUCCESS;
+ 
++   /* Nor for images without a dma-buf (CPU images), which have nothing to
++    * attach the sync file to.
++    */
++   if (chain->image_info.image_type != WSI_IMAGE_TYPE_DRM)
++      return VK_SUCCESS;
++
+    VkResult result =
+       wsi_drm_check_dma_buf_sync_file_import_export(chain->wsi, chain->device);
+    if (result == VK_ERROR_FEATURE_NOT_PRESENT)

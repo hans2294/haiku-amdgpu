@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:38:23 +0100
+Subject: [PATCH] Images may bring a GL of their own; dev image settings
+
+HAIKU_IMAGE_OWN_MESA leaves the system Mesa out. NAVI_USB_IMAGE leaves the Haiku
+repository out, as its packages would replace this build's app_server.
+FirstBootPrompt goes, as it stops a VM without a user from booting.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Jamfile                              | 17 +++++++++++++----
+ build/jam/images/definitions/minimum |  6 ++++++
+ build/jam/images/definitions/regular |  2 +-
+ 3 files changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/Jamfile b/Jamfile
+index 3aaf1e6d58..6ea640600d 100644
+--- a/Jamfile
++++ b/Jamfile
+@@ -41,10 +41,6 @@ AddHaikuImageSystemPackages [ FFilterByBuildFeatures
+ 		gutenprint9
+ 		lame
+ 		less
+-		mesa
+-		mesa_devel
+-		mesa_swpipe@!gcc2
+-		mesa_swrast@gcc2
+ 		netcat
+ 		sed
+ 		sharutils
+@@ -109,6 +105,19 @@ if $(HAIKU_PACKAGING_ARCHS[1]) != x86_gcc2 {
+ 	AddHaikuImageSystemPackages [ FFilterByBuildFeatures gcc_syslibs ] ;
+ }
+ 
++# The system Mesa, unless the image brings a GL of its own (UserBuildConfig
++# sets HAIKU_IMAGE_OWN_MESA, and puts that package in)
++if ! $(HAIKU_IMAGE_OWN_MESA) {
++	AddHaikuImageSystemPackages [ FFilterByBuildFeatures
++		regular_image @{
++			mesa
++			mesa_devel
++			mesa_swpipe@!gcc2
++			mesa_swrast@gcc2
++		}@
++	] ;
++}
++
+ if $(HAIKU_PACKAGING_ARCHS[2]) {
+ 	# secondary architectures
+ 	local architectureObject ;
+diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
+index f493f6718d..d1e5ee4049 100644
+--- a/build/jam/images/definitions/minimum
++++ b/build/jam/images/definitions/minimum
+@@ -435,6 +435,12 @@ AddFilesToHaikuImage system settings network : $(networkSettingsFiles) ;
+ # repository config and cache files
+ local repository ;
+ for repository in $(HAIKU_REPOSITORIES) {
++	# An image for a real machine keeps this build's own haiku package: an
++	# update from the official repository would replace its app_server,
++	# libgame, ... (see vm/usb-image.sh)
++	if $(NAVI_USB_IMAGE) && $(repository:G=) = Haiku {
++		continue ;
++	}
+ 	local config = [ on $(repository) return $(HAIKU_REPOSITORY_CONFIG_FILE) ] ;
+ 	local cache = [ on $(repository) return $(HAIKU_REPOSITORY_CACHE_FILE) ] ;
+ 	if $(HAIKU_UPDATE_ALL_PACKAGES) {
+diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
+index b0e5f5deef..47dd865e27 100644
+--- a/build/jam/images/definitions/regular
++++ b/build/jam/images/definitions/regular
+@@ -6,13 +6,13 @@ include [ FDirName $(HAIKU_BUILD_RULES_DIR) images definitions minimum ] ;
+ SEARCH on [ FGristFiles userguide quicktour welcome ]
+ 	= [ FDirName $(HAIKU_TOP) data bin ] ;
+ SYSTEM_BIN += userguide quicktour welcome ;
++SYSTEM_BIN += amdgputest gltest kmstest libdrmtest vkheadless tearingtest vkwindow vsynctest ;
+ 
+ SYSTEM_BIN += [ FFilterByBuildFeatures
+ 	cddb_lookup
+ 	clipboard
+ 	CortexAddOnHost
+ 	dpms
+-	FirstBootPrompt
+ 	<bin>i2c@x86,x86_64
+ 	installsound
+ 	mail

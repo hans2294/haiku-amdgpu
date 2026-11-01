@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:27:11 +0100
+Subject: [PATCH] haiku: Notice that app_server gave up on a direct window
+
+It says nothing, but deletes the semaphores, and the BDirectWindow's daemon
+goes away. Both BGLView and the WSI remember that thread and check it before
+a frame goes to the screen, instead of relying on a change in libgame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/haiku-gl/GLView.cpp             | 10 ++++++++++
+ src/vulkan/wsi/wsi_common_haiku.cpp | 10 +++++++++-
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/src/haiku-gl/GLView.cpp b/src/haiku-gl/GLView.cpp
+index 07a8b37..ef9755b 100644
+--- a/src/haiku-gl/GLView.cpp
++++ b/src/haiku-gl/GLView.cpp
+@@ -85,6 +85,7 @@ struct glview_state {
+ 	bool directEnabled;		/* EnableDirectMode(true) */
+ 	bool directConnected;	/* between B_DIRECT_START and B_DIRECT_STOP */
+ 	bool directFailed;		/* the frame buffer could not be imported */
++	thread_id directDaemon;	/* the BDirectWindow's, which calls DirectConnected() */
+ 	bool screenChanged;		/* import the frame buffer again */
+ 	void* screenBits;		/* as DirectConnected() saw it last */
+ 	clipping_rect windowBounds;	/* the window's content on screen */
+@@ -493,6 +494,14 @@ BGLView::SwapBuffers(bool vSync)
+ 		if (vSync)
+ 			BScreen(Window()).WaitForRetrace(100000);
+ 		BAutolock _(state->directLock);
++		// app_server gives up on a window whose DirectConnected() took too
++		// long. It says nothing, but deletes the semaphores, and the
++		// BDirectWindow's daemon goes away. From then on nothing tells where
++		// the window is, so the frames go through the bitmap.
++		thread_info daemon;
++		if (state->directConnected
++			&& get_thread_info(state->directDaemon, &daemon) != B_OK)
++			state->directConnected = false;
+ 		if (state->directConnected && state->screenChanged) {
+ 			release_screen(state);
+ 			state->screenChanged = false;
+@@ -796,6 +805,7 @@ BGLView::DirectConnected(direct_buffer_info* info)
+ 				state->screenChanged = true;
+ 			}
+ 			state->directConnected = true;
++			state->directDaemon = find_thread(NULL);
+ 			break;
+ 		}
+ 		case B_DIRECT_STOP:
+diff --git a/src/vulkan/wsi/wsi_common_haiku.cpp b/src/vulkan/wsi/wsi_common_haiku.cpp
+index 02553fe..d372ede 100644
+--- a/src/vulkan/wsi/wsi_common_haiku.cpp
++++ b/src/vulkan/wsi/wsi_common_haiku.cpp
+@@ -48,6 +48,7 @@ struct wsi_haiku_direct {
+    void *view;
+    BLocker lock;
+    bool connected;
++   thread_id daemon;             /* the BDirectWindow's, which told us last */
+    uint32_t generation;          /* bumped when the frame buffer may change */
+    void *bits;                   /* as DirectConnected() saw it last */
+    clipping_rect window_bounds;  /* the window's content, on screen */
+@@ -59,7 +60,7 @@ struct wsi_haiku_direct {
+    uint32_t region_capacity;
+ 
+    wsi_haiku_direct(void *view)
+-      : next(NULL), view(view), lock("wsi direct"), connected(false), generation(0), bits(NULL),
++      : next(NULL), view(view), lock("wsi direct"), connected(false), daemon(-1), generation(0), bits(NULL),
+         clips(NULL), clip_count(0), clip_capacity(0), view_offset(B_ORIGIN),
+         regions(NULL), region_capacity(0)
+    {
+@@ -202,6 +203,7 @@ direct_connected(wsi_haiku_direct *direct, const direct_buffer_info *info)
+          direct->generation++;
+       }
+       direct->connected = true;
++      direct->daemon = find_thread(NULL);
+       break;
+    }
+    case B_DIRECT_STOP:
+@@ -231,6 +233,12 @@ wsi_haiku_direct_begin(struct wsi_haiku_direct *direct,
+ {
+    if (direct == NULL || !direct->lock.Lock())
+       return false;
++   /* app_server gives up on a window whose DirectConnected() took too long.
++    * It says nothing, but deletes the semaphores, and the BDirectWindow's
++    * daemon goes away. From then on nothing tells where the window is. */
++   thread_info daemon;
++   if (direct->connected && get_thread_info(direct->daemon, &daemon) != B_OK)
++      direct->connected = false;
+    if (!direct->connected) {
+       direct->lock.Unlock();
+       return false;

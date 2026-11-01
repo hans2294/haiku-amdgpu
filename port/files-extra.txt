@@ -1,0 +1,10 @@
+# Compiled along with the Kbuild list: Linux library code amdgpu/DRM need,
+# outside the directories kbuild-files.sh walks.
+drivers/gpu/buddy.c
+drivers/video/hdmi.c
+drivers/i2c/algos/i2c-algo-bit.c
+lib/xarray.c
+lib/idr.c
+lib/rbtree.c
+lib/radix-tree.c
+lib/bitmap.c
