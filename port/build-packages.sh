@@ -57,6 +57,8 @@ cp "$mesa/gallium/targets/dri/libgallium-26.2.6.so" \
 	"$mesa/amd/vulkan/libvulkan_radeon.so" "$d/lib/"
 cp "$mesa/egl/libEGL.so.1.0.0" "$mesa/mesa/glapi/es2api/libGLESv2.so.2.0.0" \
 	"$mesa/haiku-gl/libGL.so.1.0.0" "$d/lib/"
+# The debug info of libgcc in them names the folder this was built in
+"$top/generated.x86_64/cross-tools-x86_64/bin/x86_64-unknown-haiku-strip" --strip-debug "$d"/lib/*
 for lib in libEGL.so.1.0.0 libGLESv2.so.2.0.0 libGL.so.1.0.0; do
 	soname=${lib%.*.*}		# libEGL.so.1
 	ln -s "$lib" "$d/lib/$soname"

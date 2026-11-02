@@ -101,7 +101,8 @@ white at 1920x1080 and 60 Hz, on official hrev60317 (and with the shadow on hrev
 | 30 | 76 | 0 |
 | 10 | 32 | 0 |
 
-So a program that draws without pause can still tear. With the shadow, GL and Vulkan don't draw
+On hrev60102, one run at 30 per second had 7 torn frames, where hrev60317 had none. So a program
+that draws without pause can still tear, and the numbers vary between runs. With the shadow, GL and Vulkan don't draw
 straight into the frame buffer but go through a bitmap, which is slower. Higher resolutions and
 refresh rates have not been measured, and copying takes longer there.
 
