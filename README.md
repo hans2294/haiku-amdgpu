@@ -25,13 +25,14 @@ Raphael GPU:
 - Vulkan through RADV, in windows through `vulkan_haiku.h`
 - Drawing straight into the frame buffer for `BDirectWindow` programs, without
   the CPU copying pixels
-- A tear-free desktop by page flipping (only with this repository's `app_server`,
-  in a full image)
+- A desktop with little or no tearing. A full image has this repository's `app_server`,
+  which flips by itself. On an ordinary Haiku, the accelerant flips from a shadow copy of
+  the screen; see [Tearing](#tearing)
 - Sound through the card to the monitor, over DP: stereo only, and heard in a VM,
   not yet on a real machine. See [Sound over HDMI/DP](#sound-over-hdmidp)
 
 There is no video decoding, and only the first connected monitor is used. With
-page flipping, a screenshot can show a frame that is one frame old.
+`app_server`'s page flipping, a screenshot can show a frame that is one frame old.
 
 ## Known problems
 
@@ -80,6 +81,29 @@ stop you from installing on one, as the `haiku` package counts as compatible bac
 to R1~alpha, and GL then doesn't work. Stable releases have not been tried: r1beta6
 should be refused too, and would need its own build, as its kernel has a different
 debug level.
+
+## Tearing
+
+Haiku's own `app_server` draws straight into the frame buffer. So the accelerant gives it a
+shadow in RAM instead, and a thread copies the pages written to, which the driver finds from
+the page tables' dirty bits, into a hidden buffer that it flips to at the next vblank. As
+`app_server` doesn't say when it is done drawing, the thread waits for the writes to pause.
+`TEAR_FREE=0` in the environment turns it off.
+
+Torn frames out of 451, seen through a capture dongle, on a window of 800x600 going black and
+white at 1920x1080 and 60 Hz, on official hrev60317 (and with the shadow on hrev60102, too):
+
+| Fills per second | Without the shadow | With it |
+|---|---|---|
+| As fast as it can | 451 | 26 to 92 |
+| 120 | not measured | 2 |
+| 60 | 165 | 1 |
+| 30 | 76 | 0 |
+| 10 | 32 | 0 |
+
+So a program that draws without pause can still tear. With the shadow, GL and Vulkan don't draw
+straight into the frame buffer but go through a bitmap, which is slower. Higher resolutions and
+refresh rates have not been measured, and copying takes longer there.
 
 ## The integrated GPU
 

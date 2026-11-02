@@ -1,0 +1,670 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 21:09:21 +0100
+Subject: [PATCH] amdgpu_kms: A tear-free desktop with Haiku's own app_server
+
+app_server gets a shadow in RAM as its frame buffer, and a thread flips: the
+driver tells which pages were written to, from the page tables' dirty bits, and
+they go into the hidden half of a double buffer. It waits for the writes to pause
+first, for up to half a refresh, as app_server doesn't say when it is done. GL and
+Vulkan don't draw straight into the frame buffer then. A patched app_server that
+asks for a double height mode does its own flipping, as before.
+
+Measured with a capture dongle, an 800x600 window going black and white: 451 of
+451 frames torn without it, 41 with it; 1 at 60 fills/s, 0 at 30 fills/s or less.
+
+tearingtest can pace its fills.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../accelerants/amdgpu_kms/accelerant.cpp     | 289 +++++++++++++++---
+ .../kernel/drivers/graphics/amdgpu/driver.cpp |  57 +++-
+ src/bin/tearingtest/tearingtest.cpp           |  13 +-
+ .../compat/linuxkpi/haiku/haiku_kernel.cpp    |  52 ++++
+ .../compat/linuxkpi/include/linuxkpi/haiku.h  |   5 +
+ .../compat/linuxkpi/include/linuxkpi/uapi.h   |  23 ++
+ 6 files changed, 394 insertions(+), 45 deletions(-)
+
+diff --git a/src/add-ons/accelerants/amdgpu_kms/accelerant.cpp b/src/add-ons/accelerants/amdgpu_kms/accelerant.cpp
+index 641f66bfbb..58a0cadc84 100644
+--- a/src/add-ons/accelerants/amdgpu_kms/accelerant.cpp
++++ b/src/add-ons/accelerants/amdgpu_kms/accelerant.cpp
+@@ -18,7 +18,16 @@
+ 	A mode twice as high as the display (virtual_height) gets a buffer for
+ 	two screens, with a KMS framebuffer for each half; B_MOVE_DISPLAY picks
+ 	the half to show with a page flip at the next vblank, and returns once
+-	it is shown. app_server flips like that for a tear-free desktop.
++	it is shown. A patched app_server flips like that for a tear-free desktop.
++
++	Haiku's own app_server asks for no such thing, and draws straight into the
++	frame buffer. It then gets a shadow in RAM as its frame buffer, and a thread
++	does the flipping: the driver tells which of the shadow's pages were written
++	to, they go into the hidden half, and it flips. That leaves the picture alone
++	while the display scans it out. Since app_server doesn't say when it is done
++	drawing, the thread waits for the writes to stop, and a program that draws
++	without pause can still show something half drawn. TEAR_FREE=0 in the
++	environment turns the shadow off.
+ */
+ 
+ 
+@@ -28,6 +37,7 @@
+ 
+ #include <errno.h>
+ #include <new>
++#include <sys/ioctl.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -39,6 +49,8 @@
+ #include <xf86drm.h>
+ #include <xf86drmMode.h>
+ 
++#include "../../../libs/compat/linuxkpi/include/linuxkpi/uapi.h"
++
+ 
+ #define LOG(x...)	_sPrintf("amdgpu_kms: " x)
+ 
+@@ -76,6 +88,11 @@ static uint16 sCursorX;
+ static uint16 sCursorY;
+ static bool sCursorVisible;
+ 
++static void* sShadow;
++static area_id sShadowArea = -1;
++static thread_id sShadowThread = -1;
++static volatile bool sShadowQuit;
++
+ static sem_id sRetraceSemaphore = -1;
+ static thread_id sRetraceThread = -1;
+ static volatile bool sRetraceQuit;
+@@ -332,6 +349,195 @@ page_flip_done(int fd, unsigned int frame, unsigned int seconds,
+ }
+ 
+ 
++static status_t
++flip_to_half(uint32 half)
++{
++	if (half == sShownHalf)
++		return B_OK;
++
++	uint32 framebuffer = half == 0 ? sBuffer.framebuffer : sBuffer.framebuffer2;
++	bool done = false;
++	if (drmModePageFlip(sFD, sCrtc, framebuffer, DRM_MODE_PAGE_FLIP_EVENT,
++			&done) != 0) {
++		// no flip (the CRTC is off, say): show it right away instead
++		static bool sTold;
++		if (!sTold) {
++			LOG("page flip failed (%s), setting the framebuffer\n",
++				strerror(errno));
++			sTold = true;
++		}
++		if (drmModeSetCrtc(sFD, sCrtc, framebuffer, 0, 0, &sConnector, 1,
++				&sKMSMode) != 0)
++			return B_ERROR;
++		sShownHalf = half;
++		return B_OK;
++	}
++
++	// The flip's event comes through read() on the DRM file
++	drmEventContext context = {};
++	context.version = 2;
++	context.page_flip_handler = page_flip_done;
++	while (!done) {
++		if (drmHandleEvent(sFD, &context) != 0 && errno != EINTR) {
++			LOG("waiting for the page flip failed: %s\n", strerror(errno));
++			break;
++		}
++	}
++	sShownHalf = half;
++	return B_OK;
++}
++
++
++//	#pragma mark - shadow
++
++
++/*!	Puts the pages in \a bitmap from the shadow into a half of the buffer. */
++static void
++copy_shadow_pages(const uint8* bitmap, size_t pages, uint32 half)
++{
++	uint8* source = (uint8*)sShadow;
++	uint8* target = (uint8*)sBuffer.pixels
++		+ half * sBuffer.pitch * sCurrentMode.timing.v_display;
++	size_t index = 0;
++	while (index < pages) {
++		if ((bitmap[index / 8] & (1 << (index % 8))) == 0) {
++			index++;
++			continue;
++		}
++		size_t start = index;
++		while (index < pages && (bitmap[index / 8] & (1 << (index % 8))) != 0)
++			index++;
++		memcpy(target + start * B_PAGE_SIZE, source + start * B_PAGE_SIZE,
++			(index - start) * B_PAGE_SIZE);
++	}
++}
++
++
++/*!	Adds the pages written to since the last call to \a bitmap, and tells whether
++	there were any.
++*/
++static bool
++add_written_pages(uint8* bitmap, size_t pages)
++{
++	linuxkpi_dirty_pages request = {};
++	request.address = (addr_t)sShadow;
++	request.pages = pages;
++	request.bitmap = (addr_t)bitmap;
++	if (ioctl(sFD, LINUXKPI_IOCTL_DIRTY_PAGES, &request, sizeof(request)) != 0) {
++		LOG("no dirty pages: %s\n", strerror(errno));
++		memset(bitmap, 0xff, (pages + 7) / 8);
++		return true;
++	}
++	return request.any != 0;
++}
++
++
++/*!	A frame: what was written since the last one, and what the hidden half missed
++	while it was shown, goes into the hidden half, which a flip then shows. At most
++	one per vblank, as the flip waits for it. With nothing to do it just looks now
++	and then: looking at all the pages costs something, too.
++
++	app_server doesn't say when it is done drawing, but it does stop writing, as
++	drawing comes in short bursts. So that is what a frame waits for, for up to half
++	a refresh, as what is copied in the middle of a burst shows half drawn. A program
++	that draws without pause is never done, and that is where this gives up.
++*/
++static status_t
++shadow_thread(void* cookie)
++{
++	size_t pages = (size_t)cookie;
++	size_t bytes = (pages + 7) / 8;
++	uint8* written = (uint8*)malloc(bytes);
++	uint8* missed = (uint8*)malloc(bytes);
++	if (written == NULL || missed == NULL) {
++		free(written);
++		free(missed);
++		return B_NO_MEMORY;
++	}
++	memset(missed, 0xff, bytes);
++
++	const display_timing& timing = sCurrentMode.timing;
++	bigtime_t refresh = (bigtime_t)timing.h_total * timing.v_total * 1000
++		/ timing.pixel_clock;
++
++	while (!sShadowQuit) {
++		memset(written, 0, bytes);
++		bool any = add_written_pages(written, pages);
++		for (size_t i = 0; !any && i < bytes; i++)
++			any = missed[i] != 0;
++		if (!any) {
++			// Not more often than about 60 times a second: the first frame after
++			// a quiet moment may come that late, and 7200 pages take a while.
++			snooze(16000);
++			continue;
++		}
++
++		bigtime_t deadline = system_time() + refresh / 2;
++		while (system_time() < deadline) {
++			snooze(200);
++			if (!add_written_pages(written, pages))
++				break;
++		}
++
++		for (size_t i = 0; i < bytes; i++)
++			missed[i] |= written[i];
++		uint32 hidden = 1 - sShownHalf;
++		copy_shadow_pages(missed, pages, hidden);
++		flip_to_half(hidden);
++		memcpy(missed, written, bytes);
++	}
++
++	free(written);
++	free(missed);
++	return B_OK;
++}
++
++
++static void
++set_screen_shadow(bool active)
++{
++	linuxkpi_screen_shadow shadow = {};
++	shadow.active = active ? 1 : 0;
++	ioctl(sFD, LINUXKPI_IOCTL_SET_SCREEN_SHADOW, &shadow, sizeof(shadow));
++}
++
++
++static void
++stop_shadow()
++{
++	if (sShadowThread >= 0) {
++		sShadowQuit = true;
++		status_t result;
++		wait_for_thread(sShadowThread, &result);
++		sShadowThread = -1;
++	}
++}
++
++
++static void
++free_shadow()
++{
++	stop_shadow();
++	if (sShadowArea >= 0)
++		delete_area(sShadowArea);
++	sShadowArea = -1;
++	sShadow = NULL;
++	set_screen_shadow(false);
++}
++
++
++static void
++start_shadow()
++{
++	size_t size = sBuffer.pitch * sCurrentMode.timing.v_display;
++	sShadowQuit = false;
++	sShadowThread = spawn_thread(shadow_thread, "amdgpu_kms shadow",
++		B_DISPLAY_PRIORITY, (void*)(addr_t)(size / B_PAGE_SIZE));
++	if (sShadowThread >= 0)
++		resume_thread(sShadowThread);
++}
++
++
+ //	#pragma mark - cursor
+ 
+ 
+@@ -413,6 +619,7 @@ amdgpu_kms_uninit_accelerant()
+ 		delete_sem(sRetraceSemaphore);
+ 	sRetraceSemaphore = -1;
+ 
++	free_shadow();
+ 	if (sCursor.handle != 0)
+ 		drmModeSetCursor(sFD, sCrtc, 0, 0, 0);
+ 	free_buffer(sCursor);
+@@ -525,10 +732,17 @@ amdgpu_kms_set_display_mode(display_mode* displayMode)
+ 	}
+ 
+ 	bool doubled = displayMode->virtual_height == 2 * mode->vdisplay;
++	const char* tearFree = getenv("TEAR_FREE");
++	bool shadow = !doubled && (tearFree == NULL || strcmp(tearFree, "0") != 0);
++	bool twoScreens = doubled || shadow;
++
++	// The thread is on the old buffer; it goes first.
++	stop_shadow();
++
+ 	buffer newBuffer;
+ 	status_t status = create_buffer(mode->hdisplay,
+-		mode->vdisplay * (doubled ? 2 : 1), newBuffer, !doubled);
+-	if (status == B_OK && doubled) {
++		mode->vdisplay * (twoScreens ? 2 : 1), newBuffer, !twoScreens);
++	if (status == B_OK && twoScreens) {
+ 		status = add_half_framebuffer(newBuffer, mode->hdisplay,
+ 			mode->vdisplay, 0, &newBuffer.framebuffer);
+ 		if (status == B_OK) {
+@@ -541,16 +755,37 @@ amdgpu_kms_set_display_mode(display_mode* displayMode)
+ 	if (status != B_OK) {
+ 		LOG("no frame buffer for %s%s\n", mode->name,
+ 			doubled ? " (double height)" : "");
++		if (sShadow != NULL)
++			start_shadow();
+ 		return status;
+ 	}
++
++	void* newShadow = NULL;
++	area_id newShadowArea = -1;
++	if (shadow) {
++		// Locked: all its pages are there for the driver to look at.
++		newShadowArea = create_area("amdgpu_kms shadow", &newShadow,
++			B_ANY_ADDRESS, newBuffer.pitch * mode->vdisplay, B_FULL_LOCK,
++			B_READ_AREA | B_WRITE_AREA | B_CLONEABLE_AREA);
++		if (newShadowArea < 0) {
++			LOG("no shadow, so drawing straight into the frame buffer\n");
++			newShadow = NULL;
++		}
++	}
++
+ 	drmModeModeInfo kmsMode = *mode;
+ 	if (drmModeSetCrtc(sFD, sCrtc, newBuffer.framebuffer, 0, 0, &sConnector,
+ 			1, &kmsMode) != 0) {
+ 		LOG("setting %s failed: %s\n", mode->name, strerror(errno));
++		if (newShadowArea >= 0)
++			delete_area(newShadowArea);
+ 		free_buffer(newBuffer);
++		if (sShadow != NULL)
++			start_shadow();
+ 		return B_ERROR;
+ 	}
+ 
++	free_shadow();
+ 	free_buffer(sBuffer);
+ 	sBuffer = newBuffer;
+ 	sShownHalf = 0;
+@@ -559,9 +794,15 @@ amdgpu_kms_set_display_mode(display_mode* displayMode)
+ 	if (doubled)
+ 		sCurrentMode.virtual_height *= 2;
+ 	sModeSet = true;
++	sShadow = newShadow;
++	sShadowArea = newShadowArea;
++	if (sShadow != NULL) {
++		set_screen_shadow(true);
++		start_shadow();
++	}
+ 	LOG("mode %s, %u Hz, frame buffer at %p, %" B_PRIu32 " bytes per row%s\n",
+ 		mode->name, mode->vrefresh, sBuffer.pixels, sBuffer.pitch,
+-		doubled ? ", two screens high" : "");
++		doubled ? ", two screens high" : sShadow != NULL ? ", with a shadow" : "");
+ 	return B_OK;
+ }
+ 
+@@ -604,7 +845,7 @@ amdgpu_kms_get_frame_buffer_config(frame_buffer_config* config)
+ {
+ 	if (!sModeSet)
+ 		return B_ERROR;
+-	config->frame_buffer = sBuffer.pixels;
++	config->frame_buffer = sShadow != NULL ? sShadow : sBuffer.pixels;
+ 	config->frame_buffer_dma = NULL;
+ 	config->bytes_per_row = sBuffer.pitch;
+ 	return B_OK;
+@@ -703,44 +944,12 @@ amdgpu_kms_show_cursor(bool isVisible)
+ static status_t
+ amdgpu_kms_move_display(uint16 left, uint16 top)
+ {
+-	if (!sModeSet || sBuffer.framebuffer2 == 0 || left != 0)
++	// With a shadow the flipping is ours, and app_server sees one screen.
++	if (!sModeSet || sBuffer.framebuffer2 == 0 || sShadow != NULL || left != 0)
+ 		return top == 0 && left == 0 ? B_OK : B_BAD_VALUE;
+-	uint32 half = top >= sCurrentMode.timing.v_display ? 1 : 0;
+ 	if (top != 0 && top != sCurrentMode.timing.v_display)
+ 		return B_BAD_VALUE;
+-	if (half == sShownHalf)
+-		return B_OK;
+-
+-	uint32 framebuffer = half == 0 ? sBuffer.framebuffer : sBuffer.framebuffer2;
+-	bool done = false;
+-	if (drmModePageFlip(sFD, sCrtc, framebuffer, DRM_MODE_PAGE_FLIP_EVENT,
+-			&done) != 0) {
+-		// no flip (the CRTC is off, say): show it right away instead
+-		static bool sTold;
+-		if (!sTold) {
+-			LOG("page flip failed (%s), setting the framebuffer\n",
+-				strerror(errno));
+-			sTold = true;
+-		}
+-		if (drmModeSetCrtc(sFD, sCrtc, framebuffer, 0, 0, &sConnector, 1,
+-				&sKMSMode) != 0)
+-			return B_ERROR;
+-		sShownHalf = half;
+-		return B_OK;
+-	}
+-
+-	// The flip's event comes through read() on the DRM file
+-	drmEventContext context = {};
+-	context.version = 2;
+-	context.page_flip_handler = page_flip_done;
+-	while (!done) {
+-		if (drmHandleEvent(sFD, &context) != 0 && errno != EINTR) {
+-			LOG("waiting for the page flip failed: %s\n", strerror(errno));
+-			break;
+-		}
+-	}
+-	sShownHalf = half;
+-	return B_OK;
++	return flip_to_half(top != 0 ? 1 : 0);
+ }
+ 
+ 
+diff --git a/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp b/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp
+index 47c2f15149..f41369f90b 100644
+--- a/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp
++++ b/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp
+@@ -82,6 +82,7 @@ static mutex sFileVnodeLock = MUTEX_INITIALIZER("linuxkpi file vnode");
+ static struct vnode* sFileVnode;
+ 	// referenced while the driver is loaded, to recognize the file node's fds
+ static int sInitResult;
++static bool sScreenShadow;	// see linuxkpi_screen_shadow
+ 
+ 
+ extern "C" unsigned int amdgpu_vram_limit;
+@@ -403,6 +404,42 @@ device_info(open_device* device, void* buffer)
+ }
+ 
+ 
++static status_t
++dirty_pages(void* buffer)
++{
++	linuxkpi_dirty_pages request;
++	if (!IS_USER_ADDRESS(buffer)
++		|| user_memcpy(&request, buffer, sizeof(request)) != B_OK)
++		return B_BAD_ADDRESS;
++	if (request.pages == 0 || request.pages > 16 * 1024 * 1024 / 4
++		|| !IS_USER_ADDRESS((void*)(addr_t)request.bitmap))
++		return B_BAD_VALUE;
++
++	size_t bytes = (request.pages + 7) / 8;
++	uint8* bitmap = (uint8*)malloc(bytes);
++	if (bitmap == NULL)
++		return B_NO_MEMORY;
++	// Bits get added to what is there: the caller may ask several times.
++	if (user_memcpy(bitmap, (const void*)(addr_t)request.bitmap, bytes) != B_OK) {
++		free(bitmap);
++		return B_BAD_ADDRESS;
++	}
++	long count = lkpi_haiku_dirty_pages((const void*)(addr_t)request.address,
++		request.pages, bitmap);
++	status_t status = B_OK;
++	if (count < 0)
++		status = lkpi_haiku_error(count);
++	else {
++		request.any = count > 0 ? 1 : 0;
++		if (user_memcpy((void*)(addr_t)request.bitmap, bitmap, bytes) != B_OK
++			|| user_memcpy(buffer, &request, sizeof(request)) != B_OK)
++			status = B_BAD_ADDRESS;
++	}
++	free(bitmap);
++	return status;
++}
++
++
+ static status_t
+ unmap_from_team(void* buffer)
+ {
+@@ -447,9 +484,27 @@ amdgpu_control(void* cookie, uint32 op, void* buffer, size_t length)
+ 		return B_OK;
+ 	}
+ 
+-	// These two need no Linux file: unmapping may go through any node.
++	// These need no Linux file: unmapping may go through any node.
+ 	if (op == LINUXKPI_IOCTL_DEVICE_INFO)
+ 		return device_info(device, buffer);
++	if (op == LINUXKPI_IOCTL_DIRTY_PAGES)
++		return dirty_pages(buffer);
++	if (op == LINUXKPI_IOCTL_SET_SCREEN_SHADOW) {
++		linuxkpi_screen_shadow shadow;
++		if (!IS_USER_ADDRESS(buffer)
++			|| user_memcpy(&shadow, buffer, sizeof(shadow)) != B_OK)
++			return B_BAD_ADDRESS;
++		sScreenShadow = shadow.active != 0;
++		return B_OK;
++	}
++	if (op == LINUXKPI_IOCTL_GET_SCREEN_SHADOW) {
++		linuxkpi_screen_shadow shadow = {};
++		shadow.active = sScreenShadow ? 1 : 0;
++		if (!IS_USER_ADDRESS(buffer)
++			|| user_memcpy(buffer, &shadow, sizeof(shadow)) != B_OK)
++			return B_BAD_ADDRESS;
++		return B_OK;
++	}
+ 	if (op == LINUXKPI_IOCTL_MUNMAP)
+ 		return unmap_from_team(buffer);
+ 	if (op == LINUXKPI_IOCTL_FILE_SIZE)
+diff --git a/src/bin/tearingtest/tearingtest.cpp b/src/bin/tearingtest/tearingtest.cpp
+index 2778c72a87..3126b2bddc 100644
+--- a/src/bin/tearingtest/tearingtest.cpp
++++ b/src/bin/tearingtest/tearingtest.cpp
+@@ -9,7 +9,7 @@
+ 	that tears, single frames show both; captured from the card's output,
+ 	tear-free frames are one or the other all over.
+ 
+-	tearingtest [seconds]    (default 10)
++	tearingtest [seconds] [fills per second]    (default 10, without pause)
+ */
+ 
+ 
+@@ -39,9 +39,10 @@ public:
+ 
+ class FlashApp : public BApplication {
+ public:
+-	FlashApp(bigtime_t duration)
++	FlashApp(bigtime_t duration, double rate)
+ 		: BApplication("application/x-vnd.linuxkpi-tearingtest"),
+-		  fDuration(duration) {}
++		  fDuration(duration),
++		  fPause(rate > 0 ? (bigtime_t)(1000000 / rate) : 0) {}
+ 
+ 	void ReadyToRun()
+ 	{
+@@ -69,6 +70,8 @@ private:
+ 			view->Sync();
+ 			app->fWindow->Unlock();
+ 			fills++;
++			if (app->fPause > 0)
++				snooze(app->fPause);
+ 		}
+ 		printf("%" B_PRIu32 " fills in %.1f s\n", fills,
+ 			(system_time() - start) / 1000000.0);
+@@ -77,6 +80,7 @@ private:
+ 	}
+ 
+ 	bigtime_t fDuration;
++	bigtime_t fPause;
+ 	FlashWindow* fWindow;
+ };
+ 
+@@ -85,7 +89,8 @@ int
+ main(int argc, char** argv)
+ {
+ 	setvbuf(stdout, NULL, _IOLBF, 0);
+-	FlashApp app((argc > 1 ? atof(argv[1]) : 10) * 1000000);
++	FlashApp app((argc > 1 ? atof(argv[1]) : 10) * 1000000,
++		argc > 2 ? atof(argv[2]) : 0);
+ 	app.Run();
+ 	return 0;
+ }
+diff --git a/src/libs/compat/linuxkpi/haiku/haiku_kernel.cpp b/src/libs/compat/linuxkpi/haiku/haiku_kernel.cpp
+index c3f961731a..e131e5533e 100644
+--- a/src/libs/compat/linuxkpi/haiku/haiku_kernel.cpp
++++ b/src/libs/compat/linuxkpi/haiku/haiku_kernel.cpp
+@@ -488,6 +488,58 @@ lkpi_haiku_user_mapping_release(void* mapping)
+ }
+ 
+ 
++extern "C" long
++lkpi_haiku_dirty_pages(const void* address, unsigned long pages,
++	unsigned char* bitmap)
++{
++	if (!IS_USER_ADDRESS(address) || (addr_t)address % B_PAGE_SIZE != 0)
++		return -kLinuxEINVAL;
++	VMAddressSpace* addressSpace = VMAddressSpace::GetCurrent();
++	if (addressSpace == NULL)
++		return -kLinuxEINVAL;
++
++	long count = 0;
++	addressSpace->ReadLock();
++	VMArea* source = addressSpace->LookupArea((addr_t)address);
++	if (source != NULL && (addr_t)address + pages * B_PAGE_SIZE
++			<= source->Base() + source->Size()) {
++		off_t offset = (addr_t)address - source->Base() + source->cache_offset;
++		VMCache* cache = vm_area_get_locked_cache(source);
++		for (VMArea* area = cache->areas.First(); area != NULL;
++				area = cache->areas.GetNext(area)) {
++			if (offset < area->cache_offset
++				|| offset + (off_t)(pages * B_PAGE_SIZE)
++					> area->cache_offset + (off_t)area->Size()) {
++				continue;
++			}
++			addr_t base = area->Base() + (offset - area->cache_offset);
++			VMTranslationMap* map = area->address_space->TranslationMap();
++			map->Lock();
++			for (unsigned long i = 0; i < pages; i++) {
++				addr_t page = base + i * B_PAGE_SIZE;
++				phys_addr_t physical;
++				uint32 flags;
++				if (map->Query(page, &physical, &flags) != B_OK
++					|| (flags & PAGE_MODIFIED) == 0) {
++					continue;
++				}
++				map->ClearFlags(page, PAGE_MODIFIED);
++				if ((bitmap[i / 8] & (1 << (i % 8))) == 0) {
++					bitmap[i / 8] |= 1 << (i % 8);
++					count++;
++				}
++			}
++			map->Unlock();
++		}
++		vm_area_put_locked_cache(cache);
++	} else
++		count = -kLinuxEINVAL;
++	addressSpace->ReadUnlock();
++	addressSpace->Put();
++	return count;
++}
++
++
+ extern "C" const void*
+ lkpi_haiku_acpi_vfct_image(unsigned int bus, unsigned int device,
+ 	unsigned int function, unsigned int vendorID, unsigned int deviceID,
+diff --git a/src/libs/compat/linuxkpi/include/linuxkpi/haiku.h b/src/libs/compat/linuxkpi/include/linuxkpi/haiku.h
+index e9dc7fbca0..b7042cbef3 100644
+--- a/src/libs/compat/linuxkpi/include/linuxkpi/haiku.h
++++ b/src/libs/compat/linuxkpi/include/linuxkpi/haiku.h
+@@ -63,6 +63,11 @@ int linuxkpi_chrdev_fault(void *vma, unsigned long index);
+ const void *lkpi_haiku_acpi_vfct_image(unsigned int bus, unsigned int device,
+ 	unsigned int function, unsigned int vendorID, unsigned int deviceID,
+ 	size_t *_size);
++/* Sets a bit in \a bitmap for every page written to since the last call, in
++ * the area of the calling team at \a address and its clones; returns how many,
++ * or a negative error. */
++long lkpi_haiku_dirty_pages(const void *address, unsigned long pages,
++	unsigned char *bitmap);
+ void lkpi_haiku_unmap_user(int area);
+ /* The calling team's area at a user address, or a negative error */
+ int lkpi_haiku_user_area_for(const void *address);
+diff --git a/src/libs/compat/linuxkpi/include/linuxkpi/uapi.h b/src/libs/compat/linuxkpi/include/linuxkpi/uapi.h
+index 3147808bf6..f5bd80c8bf 100644
+--- a/src/libs/compat/linuxkpi/include/linuxkpi/uapi.h
++++ b/src/libs/compat/linuxkpi/include/linuxkpi/uapi.h
+@@ -62,6 +62,23 @@ struct linuxkpi_file_size {
+ 	uint64_t size;			/* out */
+ };
+ 
++/* The pages of an area of the calling team (and its clones in other teams)
++ * written to since the last call: one bit per page, added to the bitmap. "any"
++ * says whether this call found one that wasn't set yet. */
++struct linuxkpi_dirty_pages {
++	uint64_t address;		/* in: page aligned, in the area */
++	uint64_t pages;			/* in */
++	uint64_t bitmap;		/* in: where the bits go, (pages + 7) / 8 bytes */
++	uint32_t any;			/* out: whether any is set */
++	uint32_t _reserved;
++};
++
++/* Whether the screen's frame buffer is not what app_server draws into, which is
++ * copied to it at vblanks: drawing straight into the frame buffer then won't do. */
++struct linuxkpi_screen_shadow {
++	uint32_t active;		/* in for SET, out for GET */
++};
++
+ #define LINUXKPI_BUS_UNKNOWN	0
+ #define LINUXKPI_BUS_PCI		1
+ 
+@@ -75,5 +92,11 @@ struct linuxkpi_file_size {
+ 	LINUXKPI_IOC(2, 0x03, sizeof(struct linuxkpi_device_info))
+ #define LINUXKPI_IOCTL_FILE_SIZE \
+ 	LINUXKPI_IOC(2, 0x04, sizeof(struct linuxkpi_file_size))
++#define LINUXKPI_IOCTL_DIRTY_PAGES \
++	LINUXKPI_IOC(3, 0x05, sizeof(struct linuxkpi_dirty_pages))
++#define LINUXKPI_IOCTL_SET_SCREEN_SHADOW \
++	LINUXKPI_IOC(1, 0x06, sizeof(struct linuxkpi_screen_shadow))
++#define LINUXKPI_IOCTL_GET_SCREEN_SHADOW \
++	LINUXKPI_IOC(2, 0x07, sizeof(struct linuxkpi_screen_shadow))
+ 
+ #endif

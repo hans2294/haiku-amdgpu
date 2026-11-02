@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 21:09:21 +0100
+Subject: [PATCH] haiku: No drawing straight into the frame buffer with a
+ shadow
+
+The accelerant copies app_server's shadow to it at vblanks, which would paint over
+what is there. Frames go through the bitmap then.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/haiku-gl/GLView.cpp             | 7 +++++++
+ src/vulkan/wsi/wsi_common_haiku.cpp | 9 +++++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/src/haiku-gl/GLView.cpp b/src/haiku-gl/GLView.cpp
+index ef9755b..22874e6 100644
+--- a/src/haiku-gl/GLView.cpp
++++ b/src/haiku-gl/GLView.cpp
+@@ -236,6 +236,13 @@ import_screen(glview_state* state)
+ 	if (fd < 0)
+ 		return false;
+ 
++	// app_server draws into a shadow that goes to the frame buffer at vblanks,
++	// which would paint over what we put there.
++	struct linuxkpi_screen_shadow shadow = {};
++	if (ioctl(fd, LINUXKPI_IOCTL_GET_SCREEN_SHADOW, &shadow, sizeof(shadow)) == 0
++		&& shadow.active != 0)
++		return false;
++
+ 	uint32 framebufferID = 0;
+ 	drmModeResPtr resources = drmModeGetResources(fd);
+ 	for (int i = 0; resources != NULL && i < resources->count_crtcs
+diff --git a/src/vulkan/wsi/wsi_common_haiku.cpp b/src/vulkan/wsi/wsi_common_haiku.cpp
+index d372ede..8ebefaf 100644
+--- a/src/vulkan/wsi/wsi_common_haiku.cpp
++++ b/src/vulkan/wsi/wsi_common_haiku.cpp
+@@ -302,6 +302,15 @@ wsi_haiku_screen_dma_buf(uint32_t *width, uint32_t *height, uint32_t *pitch,
+    if (fd < 0)
+       return -1;
+ 
++   /* app_server draws into a shadow that goes to the frame buffer at vblanks,
++    * which would paint over what we put there. */
++   struct linuxkpi_screen_shadow shadow = {};
++   if (ioctl(fd, LINUXKPI_IOCTL_GET_SCREEN_SHADOW, &shadow, sizeof(shadow)) == 0
++       && shadow.active != 0) {
++      close(fd);
++      return -1;
++   }
++
+    uint32_t framebufferID = 0;
+    drmModeResPtr resources = drmModeGetResources(fd);
+    for (int i = 0; resources != NULL && i < resources->count_crtcs

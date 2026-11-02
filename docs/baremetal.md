@@ -262,3 +262,32 @@ og Luanti og Firefox kørte en tid uden fejl. Det er kun brugerens indtryk: logg
 læst, så det er ikke vist, hvor VBIOS'en kom fra, eller om buffere faktisk blev flyttet.
 Accelerantet bruger kun det første kort, så Haiku bruger ikke begge GPU'er på én gang.
 
+## Uden tearing på en almindelig Haiku
+
+Haikus egen `app_server` tegner direkte i framebufferen og ved intet om page flip. Accelerantet
+giver den derfor en skyggebuffer i RAM som framebuffer, og en tråd lægger de ændrede sider over i
+den skjulte halvdel af en dobbelt buffer og flipper ved vblank. Driveren finder de ændrede sider
+med sidetabellens dirty-bits (`LINUXKPI_IOCTL_DIRTY_PAGES`), også i klonede områder. Tråden venter
+på, at skrivningerne holder pause, op til en halv opdatering, for `app_server` siger ikke, hvornår
+den er færdig. `TEAR_FREE=0` slår det fra. Beder `app_server` selv om en dobbelt høj skærm, som
+vores udgave gør, bruges skyggen ikke.
+
+GL og Vulkan tegner ikke direkte i framebufferen, når der er en skygge, for kopien ville male
+hen over dem, og går gennem bitmap-vejen (`LINUXKPI_IOCTL_GET_SCREEN_SHADOW`).
+
+Målt med capture-donglen (`vm/capture.sh`, som skal køre, før VM'en starter, for donglen melder
+sig først, når nogen læser fra den): et vindue på 800x600, der skifter mellem sort og hvidt, 451
+billeder over 15 sekunder, 1920x1080 ved 60 Hz, officiel hrev60317, med skyggen også hrev60102
+(2026-11-02). Knækkede billeder:
+
+| Tempo | Uden skygge | Med skygge |
+|---|---|---|
+| Uden pause | 451 | 26 til 92 |
+| 120 skift/s | ikke målt | 2 |
+| 60 skift/s | 165 | 1 |
+| 30 skift/s | 76 | 0 |
+| 10 skift/s | 32 | 0 |
+
+Et program, der tegner uden pause, kan stadig knække billeder. Ikke målt: 5120x1440 ved 240 Hz og
+maskinen selv.
+
