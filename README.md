@@ -26,6 +26,8 @@ On an RX 7900 GRE (Navi 31: GC 11.0.0, DCN 3.2):
   the CPU copying pixels
 - A tear-free desktop by page flipping (only with this repository's `app_server`,
   in a full image)
+- Sound through the card to the monitor, over DP: stereo only, and heard in a VM,
+  not yet on a real machine. See [Sound over HDMI/DP](#sound-over-hdmidp)
 
 There is no video decoding, and only the first connected monitor is used. With
 page flipping, a screenshot can show a frame that is one frame old.
@@ -34,11 +36,11 @@ page flipping, a screenshot can show a frame that is one frame old.
 
 **Don't use this on another card without reading this:**
 
-- **Buffers that move corrupt memory.** A mapping into a program is made once and
-  never updated (`unmap_mapping_range()` is empty in linuxkpi). If the kernel moves
-  a mapped buffer, the program keeps writing to the old place, which may by then
-  belong to something else. With 16 GiB of VRAM and Resizable BAR this has not shown
-  up. A card with little VRAM, a 256 MiB BAR or an integrated GPU will likely hit it.
+- **Buffers that move have only been tested on a card pretending to be small.**
+  Mappings now fault their pages in as on Linux, so buffers can move. That has passed
+  long tests on the RX 7900 GRE limited to 512 MiB of VRAM and a 256 MiB BAR
+  (`vramlimit` and `vis_vramlimit` in the driver's settings file, and `evicttest`),
+  but no card that is really small has run this.
 - **Only Navi 31 has run.** Code for GFX8 to GFX12 is built in, but only Navi 31's
   firmware is included, and the driver only touches the IDs on its device list.
   `/boot/home/config/settings/kernel/drivers/amdgpu` can change that (`devices 744c
@@ -48,7 +50,7 @@ page flipping, a screenshot can show a frame that is one frame old.
   [Haiku versions](#haiku-versions).
 - **A panic looks like a freeze.** The kernel debugger doesn't draw on the card's
   screen, so everything just stops, including the mouse and Caps Lock.
-- **There is an unexplained crash.** In about 35 boots in the VM, one panicked with
+- **There is an unexplained crash.** In about 50 boots in the VM, one panicked with
   a page fault in the kernel's `remove_images`, which suggests corrupted kernel
   memory, and one stopped during first boot. Neither came back in repeated runs, and
   the cause is unknown. It may well be this driver.
@@ -61,7 +63,7 @@ an earlier state under *Select package state*, or use *Select safe mode options*
 ## Haiku versions
 
 Tested in a VM with the card passed through, with official nightlies and
-a monitor on the card at 1280x720:
+a monitor on the card at 1280x720, limited to 512 MiB of VRAM:
 
 | Nightly | Date | Result |
 |---|---|---|
@@ -74,6 +76,21 @@ stop you from installing on one, as the `haiku` package counts as compatible bac
 to R1~alpha, and GL then doesn't work. Stable releases have not been tried: r1beta6
 should be refused too, and would need its own build, as its kernel has a different
 debug level.
+
+## Sound over HDMI/DP
+
+Haiku's `hda` driver skips digital outputs, so the card's audio device isn't used. A
+patch turns them on, for Navi 31's audio device (1002:ab30) only: when Haiku turned
+them on for everyone, analog sound cards lost their settings (Haiku's #20171). A full
+image has the patch. An installed Haiku needs it next to its own `hda`, which is
+blocked in `system/settings/packages`, as it would win otherwise:
+
+```bash
+sudo vm/install-hda-fix.sh <serial number of the disk>
+```
+
+The audio device may then have to be chosen under *Audio output* in Media. On official
+nightlies this has only been seen to start a stream, not been listened to.
 
 ## Building
 
@@ -111,7 +128,7 @@ This replaces the system's `mesa`, `mesa_devel` and `mesa_swpipe`. To go back, u
 ## A full image
 
 An image includes this build's `app_server` with the tear-free desktop, and the test
-programs (`amdgputest`, `gltest`, `kmstest`, `libdrmtest`, `tearingtest`, `vkheadless`,
+programs (`amdgputest`, `evicttest`, `gltest`, `kmstest`, `libdrmtest`, `tearingtest`, `vkheadless`,
 `vkwindow`, `vsynctest`):
 
 ```bash

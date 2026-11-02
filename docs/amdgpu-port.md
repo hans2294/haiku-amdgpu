@@ -579,3 +579,28 @@ koordinater.
   skærm, og blittet til skærmen var derfor ikke i brug. Selve låsene er de
   samme, men den synlige fejl skal efterprøves med en skærm på kortet.
 
+**Buffere der flytter (2026-11-02).** Mappings til programmer blev lavet én gang
+for alle, og `unmap_mapping_range()` var tom, så et program blev ved med at skrive
+til det gamle sted, når en buffer flyttede. Med `vramlimit 1024` nåede ingen af
+262.144 ord frem. Nu er en mapping en `LinuxMappingCache` (`haiku_kernel.cpp`), en
+`VMCache`, hvis `Fault()` kalder Linux' fault handler (`linuxkpi_chrdev_fault()`) og
+lægger siderne fra vma'ens tabel ind i sidetabellen. `unmap_mapping_range()` tømmer
+tabellen og sidetabellerne i alle teams, og næste adgang fejler ind igen.
+
+- **Låse:** Linux' handler kører uden cachens lås, for den tager bufferens
+  reservation, og den, der har reservationen, kan tømme tabellen. En side kortlægges
+  under cachens lås, så tømning og kortlægning ikke kan overlappe. Er bufferen optaget,
+  giver handleren op (`FAULT_FLAG_RETRY_NOWAIT`), og `Fault()` venter uden address
+  space-låsen, som Linux gør med `mmap_lock`.
+- **Oprydning:** cachen har en ekstra reference, og en mapping frigives, når ingen
+  område bruger den længere: ved `munmap` eller af `sweep_mappings()` hvert sekund, for
+  et team, der lukker, siger ikke noget.
+- **`area->cache_type` skal sættes til `CACHE_TYPE_DEVICE`** efter `vm_map_cache()`.
+  Ellers bliver sidetabellens poster stående, når området slettes, og en ny mapping på
+  samme adresse ser en gammel buffers sider.
+- **Test:** `vramlimit` og `vis_vramlimit` i driverens settings-fil gør kortet lille.
+  `evicttest` skriver og læser mappede buffere, mens VRAM fyldes igen og igen.
+  Med 512 MB: 5.847 runder uden fejl på 2 minutter, og 15 minutter sammen med Luanti,
+  Firefox, GL og Vulkan uden fejl. Forkede børn deler mappingen.
+- **Ikke afprøvet:** et rigtigt lille kort og `lock_memory()` på sider, der ikke er
+  kortlagt endnu (fx direkte I/O fra en disk ind i en mapping).

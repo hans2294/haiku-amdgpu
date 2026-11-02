@@ -1,0 +1,1163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 18:02:40 +0100
+Subject: [PATCH] linuxkpi: Mappings fault their pages in, so buffers can move
+
+A mapping was made once and for all, and unmap_mapping_range() did nothing, so
+a program kept writing to the old place when a buffer moved: to other buffers'
+memory, or freed RAM. Now a mapping is a VMCache whose Fault() runs Linux's
+fault handler and maps pages from the vma's table, and unmap_mapping_range()
+empties the table and the page tables in all teams. Teams that exit or crash
+no longer leave their mappings behind.
+
+vramlimit and vis_vramlimit in the driver's settings make a big card small for
+testing, and evicttest moves mapped buffers while it writes to them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/images/definitions/regular          |   2 +-
+ .../kernel/drivers/graphics/amdgpu/driver.cpp |  18 +-
+ src/bin/Jamfile                               |   1 +
+ src/bin/evicttest/Jamfile                     |  16 +
+ src/bin/evicttest/evicttest.c                 | 176 ++++++++++
+ src/bin/libdrmtest/libdrmtest.c               |  94 +++++-
+ .../compat/linuxkpi/haiku/haiku_kernel.cpp    | 305 +++++++++++++++---
+ .../compat/linuxkpi/include/linux/mm_types.h  |   1 -
+ .../compat/linuxkpi/include/linuxkpi/chrdev.h |   4 +
+ .../compat/linuxkpi/include/linuxkpi/haiku.h  |  18 +-
+ src/libs/compat/linuxkpi/linux/chrdev.c       | 203 ++++++++----
+ src/libs/compat/linuxkpi/linux/misc.c         |  16 +-
+ 12 files changed, 750 insertions(+), 104 deletions(-)
+ create mode 100644 src/bin/evicttest/Jamfile
+ create mode 100644 src/bin/evicttest/evicttest.c
+
+diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
+index 47dd865e27..600ef79c37 100644
+--- a/build/jam/images/definitions/regular
++++ b/build/jam/images/definitions/regular
+@@ -6,7 +6,7 @@ include [ FDirName $(HAIKU_BUILD_RULES_DIR) images definitions minimum ] ;
+ SEARCH on [ FGristFiles userguide quicktour welcome ]
+ 	= [ FDirName $(HAIKU_TOP) data bin ] ;
+ SYSTEM_BIN += userguide quicktour welcome ;
+-SYSTEM_BIN += amdgputest gltest kmstest libdrmtest vkheadless tearingtest vkwindow vsynctest ;
++SYSTEM_BIN += amdgputest evicttest gltest kmstest libdrmtest vkheadless tearingtest vkwindow vsynctest ;
+ 
+ SYSTEM_BIN += [ FFilterByBuildFeatures
+ 	cddb_lookup
+diff --git a/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp b/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp
+index 1b698d909a..47c2f15149 100644
+--- a/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp
++++ b/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp
+@@ -84,6 +84,10 @@ static struct vnode* sFileVnode;
+ static int sInitResult;
+ 
+ 
++extern "C" unsigned int amdgpu_vram_limit;
++extern "C" int amdgpu_vis_vram_limit;
++
++
+ /*!	The device list from the settings file, or the default one. */
+ static void
+ read_device_list()
+@@ -93,8 +97,17 @@ read_device_list()
+ 	const driver_settings* settings = get_driver_settings(handle);
+ 	const driver_parameter* devices = NULL;
+ 	for (int i = 0; settings != NULL && i < settings->parameter_count; i++) {
+-		if (strcmp(settings->parameters[i].name, "devices") == 0)
+-			devices = &settings->parameters[i];
++		const driver_parameter& parameter = settings->parameters[i];
++		if (strcmp(parameter.name, "devices") == 0)
++			devices = &parameter;
++		// Linux's module parameters of the same name, in MiB: a big card
++		// behaves like a small one, for testing
++		else if (strcmp(parameter.name, "vramlimit") == 0
++			&& parameter.value_count > 0)
++			amdgpu_vram_limit = strtoul(parameter.values[0], NULL, 10);
++		else if (strcmp(parameter.name, "vis_vramlimit") == 0
++			&& parameter.value_count > 0)
++			amdgpu_vis_vram_limit = strtoul(parameter.values[0], NULL, 10);
+ 	}
+ 	if (devices != NULL) {
+ 		for (int i = 0; i < devices->value_count
+@@ -194,6 +207,7 @@ extern "C" void
+ uninit_driver(void)
+ {
+ 	TRACE("running the Linux exit calls\n");
++	linuxkpi_chrdev_stop_mapping_sweep();
+ 	linuxkpi_run_exitcalls();
+ 	lkpi_haiku_shutdown();
+ 	if (sFileVnode != NULL)
+diff --git a/src/bin/Jamfile b/src/bin/Jamfile
+index dcd9246ac8..4f9eab79dd 100644
+--- a/src/bin/Jamfile
++++ b/src/bin/Jamfile
+@@ -250,6 +250,7 @@ SubInclude HAIKU_TOP src bin addattr ;
+ SubInclude HAIKU_TOP src bin amdgputest ;
+ SubInclude HAIKU_TOP src bin gltest ;
+ SubInclude HAIKU_TOP src bin kmstest ;
++SubInclude HAIKU_TOP src bin evicttest ;
+ SubInclude HAIKU_TOP src bin libdrmtest ;
+ SubInclude HAIKU_TOP src bin vkheadless ;
+ SubInclude HAIKU_TOP src bin vkwindow ;
+diff --git a/src/bin/evicttest/Jamfile b/src/bin/evicttest/Jamfile
+new file mode 100644
+index 0000000000..92a9aec0e4
+--- /dev/null
++++ b/src/bin/evicttest/Jamfile
+@@ -0,0 +1,16 @@
++SubDir HAIKU_TOP src bin evicttest ;
++
++# libdrm's errors are -errno with positive errno, as on Linux
++SubDirCcFlags -DB_USE_POSITIVE_POSIX_ERRORS ;
++
++local libdrmTop = [ FDirName $(HAIKU_TOP) .. libdrm ] ;
++SubDirSysHdrs $(libdrmTop) ;
++SubDirSysHdrs [ FDirName $(libdrmTop) amdgpu ] ;
++SubDirSysHdrs [ FDirName $(libdrmTop) include drm ] ;
++SubDirSysHdrs [ FDirName $(libdrmTop) haiku ] ;
++
++Application evicttest :
++	evicttest.c
++	: [ MultiArchDefaultGristFiles libposix_error_mapper.a ] libdrm.so
++		libdrm_amdgpu.so
++	;
+diff --git a/src/bin/evicttest/evicttest.c b/src/bin/evicttest/evicttest.c
+new file mode 100644
+index 0000000000..5a964a2f13
+--- /dev/null
++++ b/src/bin/evicttest/evicttest.c
+@@ -0,0 +1,176 @@
++/*
++ * Copyright 2026, hans2294.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*	Writes and reads mapped buffers without pause while another thread fills VRAM
++	over and over, so the buffers keep moving. Every word has to read back as
++	written, in the same mapping and in a new one. For a card made small with
++	"vramlimit" in the driver's settings file.
++
++	evicttest [seconds]    (default 30)
++*/
++
++
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++
++#include <OS.h>
++
++#include <amdgpu.h>
++#include <amdgpu_drm.h>
++
++
++enum {
++	kBuffers = 16,
++	kMaxFillers = 64
++};
++static const uint64_t kBufferSize = 256 * 1024;
++static const uint64_t kFillerSize = 32 * 1024 * 1024;
++
++static amdgpu_device_handle sDevice;
++static uint64_t sVramSize;
++static volatile bool sStop;
++static volatile uint32_t sFillRounds;
++
++
++static void*
++fill_thread(void* unused)
++{
++	struct amdgpu_bo_alloc_request request = {
++		.alloc_size = kFillerSize,
++		.phys_alignment = 4096,
++		.preferred_heap = AMDGPU_GEM_DOMAIN_VRAM,
++		.flags = AMDGPU_GEM_CREATE_NO_CPU_ACCESS,
++	};
++	amdgpu_bo_handle fillers[kMaxFillers];
++	while (!sStop) {
++		int count = 0;
++		while (!sStop && count < kMaxFillers
++			&& (uint64_t)count * kFillerSize < sVramSize * 3 / 2
++			&& amdgpu_bo_alloc(sDevice, &request, &fillers[count]) == 0) {
++			count++;
++		}
++		while (count > 0)
++			amdgpu_bo_free(fillers[--count]);
++		sFillRounds++;
++	}
++	return NULL;
++}
++
++
++static uint32_t
++check_words(const char* what, volatile uint32_t* cpu, uint32_t pattern,
++	uint32_t round, int buffer)
++{
++	uint32_t errors = 0;
++	for (uint32_t i = 0; i < kBufferSize / 4; i++) {
++		uint32_t value = cpu[i];
++		if (value != (pattern | i)) {
++			if (errors < 1) {
++				printf("FAIL  %s: buffer %d word %#" PRIx32 " (page %" PRIu32
++					") round %" PRIu32 ": %#" PRIx32 ", wrote %#" PRIx32 "\n",
++					what, buffer, i, i / 1024, round, value, pattern | i);
++			}
++			errors++;
++		}
++	}
++	return errors;
++}
++
++
++int
++main(int argc, char** argv)
++{
++	int seconds = argc > 1 ? atoi(argv[1]) : 30;
++	int fd = open("/dev/dri/renderD128", O_RDWR);
++	uint32_t major, minor;
++	if (fd < 0 || amdgpu_device_initialize(fd, &major, &minor, &sDevice) != 0) {
++		printf("FAIL  open the device\n");
++		return 1;
++	}
++	struct amdgpu_heap_info heap;
++	amdgpu_query_heap_info(sDevice, AMDGPU_GEM_DOMAIN_VRAM, 0, &heap);
++	sVramSize = heap.heap_size;
++	printf("      %" PRIu64 " MiB of VRAM, %d buffers, %d s\n", sVramSize >> 20,
++		kBuffers, seconds);
++	if (sVramSize > 4ull << 30) {
++		printf("      skipped: set vramlimit to at most 4096\n");
++		return 0;
++	}
++
++	struct amdgpu_bo_alloc_request request = {
++		.alloc_size = kBufferSize,
++		.phys_alignment = 4096,
++		.preferred_heap = AMDGPU_GEM_DOMAIN_VRAM,
++		.flags = AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED,
++	};
++	amdgpu_bo_handle buffers[kBuffers];
++	for (int i = 0; i < kBuffers; i++) {
++		if (amdgpu_bo_alloc(sDevice, &request, &buffers[i]) != 0) {
++			printf("FAIL  amdgpu_bo_alloc\n");
++			return 1;
++		}
++	}
++
++	pthread_t filler;
++	pthread_create(&filler, NULL, fill_thread, NULL);
++
++	bigtime_t end = system_time() + seconds * (bigtime_t)1000000;
++	uint32_t round = 0;
++	uint32_t sameErrors = 0, newErrors = 0;
++	while (system_time() < end && sameErrors + newErrors < 8) {
++		uint32_t pattern = (round & 0x7f) << 24;
++		for (int b = 0; b < kBuffers; b++) {
++			void* mapped;
++			if (amdgpu_bo_cpu_map(buffers[b], &mapped) != 0) {
++				printf("FAIL  amdgpu_bo_cpu_map\n");
++				newErrors++;
++				continue;
++			}
++			volatile uint32_t* cpu = mapped;
++			for (uint32_t i = 0; i < kBufferSize / 4; i++)
++				cpu[i] = pattern | i;
++			sameErrors += check_words("same mapping", cpu, pattern, round, b);
++			amdgpu_bo_cpu_unmap(buffers[b]);
++
++			amdgpu_bo_cpu_map(buffers[b], &mapped);
++			uint32_t errors = check_words("new mapping", mapped, pattern, round,
++				b);
++			newErrors += errors;
++			if (errors > 0) {
++				// Does it heal? Then the kernel let us read too early. If not,
++				// the data is gone, or the CPU's cache is in the way.
++				snooze(300000);
++				uint32_t later = check_words("0.3 s later", mapped, pattern,
++					round, b);
++				amdgpu_bo_cpu_unmap(buffers[b]);
++				amdgpu_bo_cpu_map(buffers[b], &mapped);
++				uint32_t again = check_words("mapped again", mapped, pattern,
++					round, b);
++				printf("      %" PRIu32 " bad words, %" PRIu32 " 0.3 s later, %"
++					PRIu32 " mapped again\n", errors, later, again);
++			}
++			amdgpu_bo_cpu_unmap(buffers[b]);
++		}
++		round++;
++	}
++	sStop = true;
++	pthread_join(filler, NULL);
++
++	printf("      %" PRIu32 " rounds, VRAM filled %" PRIu32 " times, %" PRIu32
++		" bad words in the same mapping, %" PRIu32 " in a new one\n", round,
++		sFillRounds, sameErrors, newErrors);
++	for (int i = 0; i < kBuffers; i++)
++		amdgpu_bo_free(buffers[i]);
++	amdgpu_device_deinitialize(sDevice);
++	close(fd);
++	printf("%s\n", sameErrors + newErrors == 0 ? "PASS" : "DONE: failures");
++	return sameErrors + newErrors == 0 ? 0 : 1;
++}
+diff --git a/src/bin/libdrmtest/libdrmtest.c b/src/bin/libdrmtest/libdrmtest.c
+index f97d5f51b4..dd355944b0 100644
+--- a/src/bin/libdrmtest/libdrmtest.c
++++ b/src/bin/libdrmtest/libdrmtest.c
+@@ -318,12 +318,18 @@ test_fork(amdgpu_device_handle device, const char *what, uint32_t heap,
+ 		for (uint32_t i = 0; i < size / 4; i++)
+ 			cpu[i] = 0x11000000 | i;
+ 
++		// The child shares the mapping, and faults its own pages in
+ 		pid_t child = fork();
+-		if (child == 0)
++		if (child == 0) {
++			cpu[1] = 0x55000000;
+ 			_exit(0);
++		}
+ 		int status = 0;
+ 		check("fork: fork and wait",
+ 			child > 0 && waitpid(child, &status, 0) == child ? 0 : -ECHILD);
++		snprintf(name, sizeof(name), "fork: the child's write arrives (%s)",
++			what);
++		check(name, cpu[1] == 0x55000000 ? 0 : -EIO);
+ 
+ 		for (uint32_t i = 0; i < size / 4; i++)
+ 			cpu[i] = 0x22000000 | i;
+@@ -345,6 +351,91 @@ test_fork(amdgpu_device_handle device, const char *what, uint32_t heap,
+ }
+ 
+ 
++/*	A mapped buffer that the kernel moves out of a full VRAM: what the program
++	writes to its mapping afterwards has to reach the buffer. Only runs on a card
++	made small with "vramlimit" in the driver's settings file.
++*/
++static void
++test_eviction(amdgpu_device_handle device)
++{
++	struct amdgpu_heap_info heap;
++	if (amdgpu_query_heap_info(device, AMDGPU_GEM_DOMAIN_VRAM, 0, &heap) != 0
++		|| heap.heap_size > 4ull << 30) {
++		printf("      eviction: skipped, set vramlimit to at most 4096\n");
++		return;
++	}
++
++	const uint64_t size = 1024 * 1024;
++	struct amdgpu_bo_alloc_request request = {
++		.alloc_size = size,
++		.phys_alignment = 4096,
++		.preferred_heap = AMDGPU_GEM_DOMAIN_VRAM,
++		.flags = AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED,
++	};
++	amdgpu_bo_handle bo;
++	uint32_t *cpu;
++	if (!check("eviction: amdgpu_bo_alloc", amdgpu_bo_alloc(device, &request,
++			&bo)))
++		return;
++	if (!check("eviction: amdgpu_bo_cpu_map", amdgpu_bo_cpu_map(bo,
++			(void **)&cpu))) {
++		amdgpu_bo_free(bo);
++		return;
++	}
++	for (uint32_t i = 0; i < size / 4; i++)
++		cpu[i] = 0x33000000 | i;
++
++	// More than fits: the kernel has to move the oldest ones out
++	enum { kMaxFillers = 256 };
++	amdgpu_bo_handle fillers[kMaxFillers];
++	int fillerCount = 0;
++	const uint64_t fillerSize = 64 * 1024 * 1024;
++	struct amdgpu_bo_alloc_request fillerRequest = {
++		.alloc_size = fillerSize,
++		.phys_alignment = 4096,
++		.preferred_heap = AMDGPU_GEM_DOMAIN_VRAM,
++		.flags = AMDGPU_GEM_CREATE_NO_CPU_ACCESS,
++	};
++	while (fillerCount < kMaxFillers
++		&& (uint64_t)fillerCount * fillerSize < heap.heap_size * 3 / 2
++		&& amdgpu_bo_alloc(device, &fillerRequest,
++			&fillers[fillerCount]) == 0) {
++		fillerCount++;
++	}
++	printf("      eviction: %d buffers of 64 MiB on %" PRIu64 " MiB of VRAM\n",
++		fillerCount, heap.heap_size >> 20);
++
++	uint32_t errors = 0;
++	for (uint32_t i = 0; i < size / 4; i++) {
++		if (cpu[i] != (0x33000000 | i))
++			errors++;
++	}
++	check("eviction: the mapping still shows the contents",
++		errors == 0 ? 0 : -EIO);
++
++	for (uint32_t i = 0; i < size / 4; i++)
++		cpu[i] = 0x44000000 | i;
++
++	amdgpu_bo_cpu_unmap(bo);
++	if (check("eviction: map again", amdgpu_bo_cpu_map(bo, (void **)&cpu))) {
++		errors = 0;
++		for (uint32_t i = 0; i < size / 4; i++) {
++			if (cpu[i] != (0x44000000 | i))
++				errors++;
++		}
++		printf("      eviction: %" PRIu32 " of %" PRIu64 " words differ\n",
++			errors, size / 4);
++		check("eviction: writes reach the moved buffer",
++			errors == 0 ? 0 : -EIO);
++		amdgpu_bo_cpu_unmap(bo);
++	}
++
++	while (fillerCount > 0)
++		amdgpu_bo_free(fillers[--fillerCount]);
++	amdgpu_bo_free(bo);
++}
++
++
+ /*	What a client needs for drawing straight into the screen: the CRTC's
+ 	frame buffer from the primary node (not being master), as a dma-buf fd
+ 	that imports on the render node.
+@@ -429,6 +520,7 @@ main(void)
+ 		test_fork(device, "GTT", AMDGPU_GEM_DOMAIN_GTT, 0);
+ 		test_fork(device, "VRAM", AMDGPU_GEM_DOMAIN_VRAM,
+ 			AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED);
++		test_eviction(device);
+ 		check("amdgpu_device_deinitialize", amdgpu_device_deinitialize(device));
+ 	}
+ 
+diff --git a/src/libs/compat/linuxkpi/haiku/haiku_kernel.cpp b/src/libs/compat/linuxkpi/haiku/haiku_kernel.cpp
+index c47a4fc8a9..7a92b490f0 100644
+--- a/src/libs/compat/linuxkpi/haiku/haiku_kernel.cpp
++++ b/src/libs/compat/linuxkpi/haiku/haiku_kernel.cpp
+@@ -12,6 +12,7 @@
+ #include <errno.h>
+ 
+ #include <heap.h>
++#include <new>
+ #include <lock.h>
+ #include <smp.h>
+ #include <team.h>
+@@ -21,6 +22,10 @@
+ #include <util/iovec_support.h>
+ #include <vm/vm.h>
+ #include <vm/VMAddressSpace.h>
++#include <vm/VMArea.h>
++#include <vm/VMCache.h>
++#include <vm/VMTranslationMap.h>
++#include <vm/vm_priv.h>
+ #include <vm/vm_page.h>
+ 
+ #include "../include/linuxkpi/haiku.h"
+@@ -202,55 +207,283 @@ lkpi_haiku_map_pages(const unsigned long long* physical, unsigned long count,
+ }
+ 
+ 
+-extern "C" int
+-lkpi_haiku_map_user(const unsigned long long* physical, unsigned long count,
+-	int cacheMode, int writable, void** _address)
++//	#pragma mark - mappings to userspace
++
++
++/*!	The cache of a mapping into teams: it gets its pages from the Linux fault
++	handler on demand and has none of its own. Like a device cache, except that
++	a page table entry is only there as long as the buffer's page stays where it
++	is. The table has the current pages, or 0.
++
++	Locks: the Linux fault handler takes the buffer's reservation, and whoever
++	holds that may clear pages here, which takes this cache's lock. So the handler
++	runs without this lock, and a page that is in the table is mapped with it:
++	clearing a page and mapping it can't overlap.
++*/
++class LinuxMappingCache final : public VMCache {
++public:
++	LinuxMappingCache(void* vma, unsigned long long* table, size_t pages)
++		:
++		fVma(vma),
++		fTable(table),
++		fPages(pages)
++	{
++	}
++
++	status_t Init()
++	{
++		return VMCache::Init("linuxkpi mapping", CACHE_TYPE_DEVICE, 0);
++	}
++
++	// Nothing to commit: the buffer has its memory.
++	status_t Commit(off_t size, int priority) override
++	{
++		return B_OK;
++	}
++
++	status_t Fault(VMAddressSpace* addressSpace, off_t offset) override;
++	void Clear(size_t first, size_t count);
++
++protected:
++	void DeleteObject() override
++	{
++		delete this;
++	}
++
++private:
++	VMArea* _AreaIn(VMAddressSpace* addressSpace);
++	void _MapPages(VMTranslationMap* map, VMArea* area, size_t index,
++		vm_page_reservation* reservation);
++
++	static const size_t kMapAhead = 16;
++
++	void*				fVma;
++	volatile unsigned long long* fTable;
++	size_t				fPages;
++};
++
++
++VMArea*
++LinuxMappingCache::_AreaIn(VMAddressSpace* addressSpace)
+ {
+-	generic_io_vec* vecs = (generic_io_vec*)malloc(sizeof(generic_io_vec)
+-		* count);
+-	if (vecs == NULL)
+-		return -kLinuxENOMEM;
+-	uint32 vecCount = 0;
+-	for (unsigned long i = 0; i < count; i++) {
+-		if (vecCount > 0 && vecs[vecCount - 1].base
+-				+ vecs[vecCount - 1].length == physical[i]) {
+-			vecs[vecCount - 1].length += B_PAGE_SIZE;
++	for (VMArea* area = areas.First(); area != NULL; area = areas.GetNext(area)) {
++		if (area->address_space == addressSpace)
++			return area;
++	}
++	return NULL;
++}
++
++
++void
++LinuxMappingCache::_MapPages(VMTranslationMap* map, VMArea* area, size_t index,
++	vm_page_reservation* reservation)
++{
++	uint32 protection = area->protection & (B_READ_AREA | B_WRITE_AREA
++		| B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
++	size_t end = min_c(fPages, index + kMapAhead);
++
++	map->Lock();
++	for (size_t i = index; i < end; i++) {
++		unsigned long long entry = fTable[i];
++		if (entry == 0)
++			break;
++
++		addr_t address = area->Base() + i * B_PAGE_SIZE;
++		phys_addr_t physical;
++		uint32 flags;
++		if (map->Query(address, &physical, &flags) == B_OK
++			&& (flags & PAGE_PRESENT) != 0) {
+ 			continue;
+ 		}
+-		vecs[vecCount].base = physical[i];
+-		vecs[vecCount].length = B_PAGE_SIZE;
+-		vecCount++;
++
++		uint32 memoryType = 0;
++		switch ((entry & (B_PAGE_SIZE - 1)) - LKPI_HAIKU_ENTRY(0)) {
++			case LKPI_HAIKU_CACHE_UNCACHED:
++				memoryType = B_UNCACHED_MEMORY;
++				break;
++			case LKPI_HAIKU_CACHE_WRITE_COMBINING:
++				memoryType = B_WRITE_COMBINING_MEMORY;
++				break;
++		}
++		map->Map(address, entry & ~(unsigned long long)(B_PAGE_SIZE - 1),
++			protection, memoryType, reservation);
+ 	}
++	map->Unlock();
++}
++
++
++/*!	Called with the address space read locked and the cache locked. */
++status_t
++LinuxMappingCache::Fault(VMAddressSpace* addressSpace, off_t offset)
++{
++	size_t index = offset / B_PAGE_SIZE;
++	if (index >= fPages)
++		return B_BAD_ADDRESS;
++	if (thread_get_current_thread()->page_fault_waits_allowed < 1)
++		return B_BUSY;
++
++	VMArea* area = _AreaIn(addressSpace);
++	if (area == NULL)
++		return B_BAD_ADDRESS;
++
++	// Reserving may wait for the page daemon, which may want this cache.
++	addr_t base = area->Base() + index * B_PAGE_SIZE;
++	VMTranslationMap* map = addressSpace->TranslationMap();
++	Unlock();
++	vm_page_reservation reservation;
++	vm_page_reserve_pages(&reservation,
++		map->MaxPagesNeededToMap(base, base + kMapAhead * B_PAGE_SIZE - 1),
++		VM_PRIORITY_USER);
++	Lock();
++
++	status_t status = B_OK;
++	while (true) {
++		area = _AreaIn(addressSpace);
++		if (area == NULL) {
++			status = B_BAD_ADDRESS;
++			break;
++		}
++		if (fTable[index] != 0) {
++			_MapPages(map, area, index, &reservation);
++			break;
++		}
+ 
+-	void* address = NULL;
++		Unlock();
++		int result = linuxkpi_chrdev_fault(fVma, index);
++		if (result > 0) {
++			// The buffer is busy, and whoever has it may be waiting for this
++			// address space (or be behind someone who is, as readers wait for
++			// writers). So wait without it, like Linux on VM_FAULT_RETRY.
++			addressSpace->ReadUnlock();
++			snooze(1000);
++			addressSpace->ReadLock();
++		}
++		Lock();
++		if (result < 0) {
++			status = B_BAD_ADDRESS;
++			break;
++		}
++	}
++
++	vm_page_unreserve_pages(&reservation);
++	return status;
++}
++
++
++void
++LinuxMappingCache::Clear(size_t first, size_t count)
++{
++	Lock();
++	for (size_t i = 0; i < count; i++)
++		fTable[first + i] = 0;
++	for (VMArea* area = areas.First(); area != NULL; area = areas.GetNext(area)) {
++		VMTranslationMap* map = area->address_space->TranslationMap();
++		addr_t start = area->Base() + first * B_PAGE_SIZE;
++		map->Lock();
++		map->Unmap(start, start + count * B_PAGE_SIZE - 1);
++		map->Unlock();
++	}
++	Unlock();
++}
++
++
++extern "C" void*
++lkpi_haiku_map_user(void* vma, unsigned long long* table, unsigned long count,
++	int writable, void** _address)
++{
++	LinuxMappingCache* cache = new(std::nothrow) LinuxMappingCache(vma, table,
++		count);
++	if (cache == NULL)
++		return NULL;
++	if (cache->Init() != B_OK) {
++		cache->Delete();
++		return NULL;
++	}
+ 	addr_t size = count * B_PAGE_SIZE;
++	cache->virtual_end = size;
++
++	VMAddressSpace* addressSpace = VMAddressSpace::GetCurrent();
++	if (addressSpace == NULL) {
++		cache->Delete();
++		return NULL;
++	}
++
+ 	// Shared, like a shared mapping on Linux. A private area would go
+-	// copy-on-write at the team's next fork(), and the next write would then
+-	// replace the buffer's page with a copy or, for one that isn't RAM, panic.
++	// copy-on-write at the team's next fork().
+ 	uint32 protection = B_READ_AREA | B_KERNEL_READ_AREA | B_SHARED_AREA;
+ 	if (writable)
+ 		protection |= B_WRITE_AREA | B_KERNEL_WRITE_AREA;
+-	area_id area = vm_map_physical_memory_vecs(team_get_current_team_id(),
+-		"linuxkpi mapping", &address, B_RANDOMIZED_ANY_ADDRESS, &size,
+-		protection, vecs, vecCount);
+-	free(vecs);
+-	if (area < 0)
+-		return -kLinuxENOMEM;
+ 
+-	// The vector mapping is always write-back; switch the whole area over.
+-	uint32 memoryType = 0;
+-	if (cacheMode == LKPI_HAIKU_CACHE_UNCACHED)
+-		memoryType = B_UNCACHED_MEMORY;
+-	else if (cacheMode == LKPI_HAIKU_CACHE_WRITE_COMBINING)
+-		memoryType = B_WRITE_COMBINING_MEMORY;
+-	if (memoryType != 0
+-		&& vm_set_area_memory_type(area, physical[0], memoryType) != B_OK) {
+-		vm_delete_area(team_get_current_team_id(), area, true);
+-		return -kLinuxEINVAL;
+-	}
++	addressSpace->WriteLock();
++	cache->Lock();
++	virtual_address_restrictions restrictions = {};
++	restrictions.address_specification = B_RANDOMIZED_ANY_ADDRESS;
++	VMArea* area;
++	void* address = NULL;
++	status_t status = vm_map_cache(addressSpace, cache, 0, "linuxkpi mapping",
++		size, B_NO_LOCK, protection, 0, REGION_NO_PRIVATE_MAP,
++		CREATE_AREA_DONT_COMMIT_MEMORY, &restrictions, true, &area, &address);
++	if (status == B_OK) {
++		// As it decides how the area's pages get unmapped: there is no list of
++		// them, as for pages from a cache.
++		area->cache_type = CACHE_TYPE_DEVICE;
++
++		// One reference for the area, which it got from the start, and one for
++		// us, to find out when all areas are gone.
++		cache->AcquireRefLocked();
++		cache->Unlock();
++	} else
++		cache->ReleaseRefAndUnlock();
++	addressSpace->WriteUnlock();
++	addressSpace->Put();
++	if (status != B_OK)
++		return NULL;
+ 
+ 	*_address = address;
+-	return area;
++	return cache;
++}
++
++
++extern "C" void*
++lkpi_haiku_user_mapping_for(const void* address)
++{
++	if (!IS_USER_ADDRESS(address))
++		return NULL;
++	VMAddressSpace* addressSpace = VMAddressSpace::GetCurrent();
++	if (addressSpace == NULL)
++		return NULL;
++	addressSpace->ReadLock();
++	VMArea* area = addressSpace->LookupArea((addr_t)address);
++	void* mapping = area != NULL ? area->cache : NULL;
++	addressSpace->ReadUnlock();
++	addressSpace->Put();
++	return mapping;
++}
++
++
++extern "C" void
++lkpi_haiku_user_mapping_clear(void* mapping, unsigned long first,
++	unsigned long count)
++{
++	((LinuxMappingCache*)mapping)->Clear(first, count);
++}
++
++
++extern "C" int
++lkpi_haiku_user_mapping_unused(void* mapping)
++{
++	LinuxMappingCache* cache = (LinuxMappingCache*)mapping;
++	cache->Lock();
++	bool unused = cache->areas.IsEmpty();
++	cache->Unlock();
++	return unused ? 1 : 0;
++}
++
++
++extern "C" void
++lkpi_haiku_user_mapping_release(void* mapping)
++{
++	((LinuxMappingCache*)mapping)->ReleaseRef();
+ }
+ 
+ 
+diff --git a/src/libs/compat/linuxkpi/include/linux/mm_types.h b/src/libs/compat/linuxkpi/include/linux/mm_types.h
+index 2430dffd8f..535ae73933 100644
+--- a/src/libs/compat/linuxkpi/include/linux/mm_types.h
++++ b/src/libs/compat/linuxkpi/include/linux/mm_types.h
+@@ -70,7 +70,6 @@ struct vm_area_struct {
+ 	/* Filled by vmf_insert_*() while linuxkpi faults the mapping in */
+ 	unsigned long long *linuxkpi_physical;
+ 	unsigned long linuxkpi_pages;
+-	unsigned long linuxkpi_cache;	/* _PAGE_CACHE_* of the last insert */
+ };
+ struct mm_struct {
+ 	struct rw_semaphore mmap_lock;
+diff --git a/src/libs/compat/linuxkpi/include/linuxkpi/chrdev.h b/src/libs/compat/linuxkpi/include/linuxkpi/chrdev.h
+index 0c65f6f2e4..674795b1ad 100644
+--- a/src/libs/compat/linuxkpi/include/linuxkpi/chrdev.h
++++ b/src/libs/compat/linuxkpi/include/linuxkpi/chrdev.h
+@@ -41,6 +41,10 @@ int linuxkpi_chrdev_mmap(void *cookie, unsigned long long offset,
+ 	unsigned long long size, int writable, void **_address);
+ /* Undoes linuxkpi_chrdev_mmap() for the mapping at \a address */
+ int linuxkpi_chrdev_munmap(void *address);
++/* unmap_mapping_range(): a buffer moved, its pages fault in again */
++void linuxkpi_chrdev_unmap_range(long long begin, long long length);
++/* Before the driver goes away */
++void linuxkpi_chrdev_stop_mapping_sweep(void);
+ 
+ /* Fills a struct linuxkpi_device_info (uapi.h) for the node at \a path */
+ struct linuxkpi_device_info;
+diff --git a/src/libs/compat/linuxkpi/include/linuxkpi/haiku.h b/src/libs/compat/linuxkpi/include/linuxkpi/haiku.h
+index e68800e6fa..d2c20e74ff 100644
+--- a/src/libs/compat/linuxkpi/include/linuxkpi/haiku.h
++++ b/src/libs/compat/linuxkpi/include/linuxkpi/haiku.h
+@@ -42,8 +42,22 @@ int lkpi_haiku_area_for(const void *address);
+ void lkpi_haiku_wbinvd_all_cpus(void);
+ /* An area in the calling team mapping these pages (adjacent ones are merged
+  * into one range); the area ID, or a negative error. */
+-int lkpi_haiku_map_user(const unsigned long long *physical,
+-	unsigned long count, int cacheMode, int writable, void **_address);
++/* A mapping into the current team, whose pages come from a fault handler, as on
++ * Linux: linuxkpi_chrdev_fault() fills the table, one entry per page of physical
++ * address | LKPI_HAIKU_ENTRY(cache mode), and pages get mapped from it. */
++#define LKPI_HAIKU_ENTRY(cacheMode)	((cacheMode) + 1ull)
++void *lkpi_haiku_map_user(void *vma, unsigned long long *table,
++	unsigned long count, int writable, void **_address);
++/* The mapping behind an address of the current team, or NULL */
++void *lkpi_haiku_user_mapping_for(const void *address);
++/* The pages are gone: forget them, in every team; the next access faults */
++void lkpi_haiku_user_mapping_clear(void *mapping, unsigned long first,
++	unsigned long count);
++/* Whether all teams have let go of the mapping */
++int lkpi_haiku_user_mapping_unused(void *mapping);
++void lkpi_haiku_user_mapping_release(void *mapping);
++/* From the fault handler: 0 when the entry is filled, > 0 to try again, or -errno */
++int linuxkpi_chrdev_fault(void *vma, unsigned long index);
+ void lkpi_haiku_unmap_user(int area);
+ /* The calling team's area at a user address, or a negative error */
+ int lkpi_haiku_user_area_for(const void *address);
+diff --git a/src/libs/compat/linuxkpi/linux/chrdev.c b/src/libs/compat/linuxkpi/linux/chrdev.c
+index 7f9ea73800..e032cd62ef 100644
+--- a/src/libs/compat/linuxkpi/linux/chrdev.c
++++ b/src/libs/compat/linuxkpi/linux/chrdev.c
+@@ -24,6 +24,7 @@
+ #include <linux/fcntl.h>
+ #include <linux/mm.h>
+ #include <linux/printk.h>
++#include <linux/workqueue.h>
+ 
+ #include <linuxkpi/chrdev.h>
+ #include <linuxkpi/haiku.h>
+@@ -44,14 +45,18 @@ struct chrdev_node {
+ 	char *path;
+ };
+ 
+-/* A mapping into a team; it holds the file like a Linux vma does. */
++/* A mapping into teams; it holds the file like a Linux vma does. It stays until
++   all of them have let go of it, which they don't say when they just exit. */
+ struct chrdev_mapping {
+ 	struct list_head link;
+-	int area;
++	void *haiku;
+ 	struct vm_area_struct *vma;
+ };
+ 
++static void sweep_mappings(struct work_struct *work);
++
+ static DEFINE_MUTEX(sChrdevLock);
++static DECLARE_DELAYED_WORK(sMappingSweep, sweep_mappings);
+ static LIST_HEAD(sMajors);
+ static LIST_HEAD(sNodes);
+ static LIST_HEAD(sMappings);
+@@ -314,12 +319,10 @@ linuxkpi_chrdev_read(void *cookie, void *buffer, unsigned long length,
+ //	#pragma mark - mappings
+ 
+ 
+-/*!	Haiku cannot fault pages in through a driver, so the mapping is made
+-	complete up front: the file's mmap() sets the vma up, then its fault
+-	handler runs for every page and the inserted pages (see
+-	vmf_insert_pfn_prot()) become one area.
+-	TODO: buffers that move afterwards (eviction) keep their old pages;
+-	unmap_mapping_range() should redo the mapping.
++/*!	Like a Linux vma: the file's mmap() sets it up, and its fault handler runs
++	when a program touches a page (see lkpi_haiku_map_user()). A buffer that moves
++	takes its pages out of the mappings with unmap_mapping_range().
++	Returns the new area in the calling team, or a negative error.
+ */
+ int
+ linuxkpi_chrdev_mmap(void *cookie, unsigned long long offset,
+@@ -334,13 +337,12 @@ linuxkpi_chrdev_mmap(void *cookie, unsigned long long offset,
+ 	struct vm_area_struct *vma = kzalloc(sizeof(*vma), GFP_KERNEL);
+ 	struct chrdev_mapping *mapping = kzalloc(sizeof(*mapping), GFP_KERNEL);
+ 	unsigned long pages = size >> PAGE_SHIFT;
+-	unsigned long long *physical = kvcalloc(pages, sizeof(*physical),
+-		GFP_KERNEL);
++	unsigned long long *table = kvcalloc(pages, sizeof(*table), GFP_KERNEL);
+ 	int error = -ENOMEM;
+-	if (vma == NULL || mapping == NULL || physical == NULL)
++	if (vma == NULL || mapping == NULL || table == NULL)
+ 		goto err_free;
+ 
+-	// The vma lives at 0; the real address is Haiku's choice, later.
++	// The vma lives at 0; the real address is Haiku's choice, per team.
+ 	vma->vm_start = 0;
+ 	vma->vm_end = size;
+ 	vma->vm_pgoff = offset >> PAGE_SHIFT;
+@@ -348,79 +350,162 @@ linuxkpi_chrdev_mmap(void *cookie, unsigned long long offset,
+ 	vma->__vm_flags = VM_READ | VM_SHARED | VM_MAYREAD | VM_MAYSHARE
+ 		| (writable ? VM_WRITE | VM_MAYWRITE : 0);
+ 	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+-	vma->linuxkpi_physical = physical;
++	vma->linuxkpi_physical = table;
+ 	vma->linuxkpi_pages = pages;
+ 
+ 	error = file->f_op->mmap(file, vma);
+ 	if (error != 0)
+ 		goto err_free;
+ 
+-	for (unsigned long i = 0; i < pages; i++) {
+-		if (physical[i] != 0)
+-			continue;
+-		if (vma->vm_ops == NULL || vma->vm_ops->fault == NULL) {
+-			error = -ENXIO;
+-			goto err_close;
+-		}
+-		struct vm_fault vmf = {
+-			.vma = vma,
+-			.pgoff = vma->vm_pgoff + i,
+-			.address = vma->vm_start + i * PAGE_SIZE,
+-			.flags = writable ? FAULT_FLAG_WRITE : 0,
+-		};
+-		vm_fault_t result = vma->vm_ops->fault(&vmf);
+-		if ((result & VM_FAULT_ERROR) != 0 || physical[i] == 0) {
+-			error = (result & VM_FAULT_OOM) != 0 ? -ENOMEM : -EFAULT;
+-			goto err_close;
++	// Without a fault handler, mmap() has inserted everything there will be.
++	if (vma->vm_ops == NULL || vma->vm_ops->fault == NULL) {
++		for (unsigned long i = 0; i < pages; i++) {
++			if (table[i] == 0) {
++				error = -ENXIO;
++				goto err_close;
++			}
+ 		}
+ 	}
+ 
+-	int cacheMode = LKPI_HAIKU_CACHE_CACHED;
+-	if (vma->linuxkpi_cache == _PAGE_CACHE_WC)
+-		cacheMode = LKPI_HAIKU_CACHE_WRITE_COMBINING;
+-	else if (vma->linuxkpi_cache == _PAGE_CACHE_UC)
+-		cacheMode = LKPI_HAIKU_CACHE_UNCACHED;
+-	int area = lkpi_haiku_map_user(physical, pages, cacheMode, writable,
+-		_address);
+-	if (area < 0) {
+-		error = area;
++	mapping->haiku = lkpi_haiku_map_user(vma, table, pages, writable, _address);
++	if (mapping->haiku == NULL) {
++		error = -ENOMEM;
+ 		goto err_close;
+ 	}
+ 
+-	vma->linuxkpi_physical = NULL;
+-	kvfree(physical);
+ 	get_file(file);
+-	mapping->area = area;
+ 	mapping->vma = vma;
+ 	mutex_lock(&sChrdevLock);
+ 	list_add_tail(&mapping->link, &sMappings);
+ 	mutex_unlock(&sChrdevLock);
+-	return area;
++	schedule_delayed_work(&sMappingSweep, HZ);
++	return lkpi_haiku_user_area_for(*_address);
+ 
+ err_close:
+ 	if (vma->vm_ops != NULL && vma->vm_ops->close != NULL)
+ 		vma->vm_ops->close(vma);
+ err_free:
+-	kvfree(physical);
++	kvfree(table);
+ 	kfree(mapping);
+ 	kfree(vma);
+ 	return error;
+ }
+ 
+ 
++int
++linuxkpi_chrdev_fault(void *_vma, unsigned long index)
++{
++	struct vm_area_struct *vma = _vma;
++	if (vma->vm_ops == NULL || vma->vm_ops->fault == NULL)
++		return -EFAULT;
++
++	// As a fault that may give up instead of waiting: the caller waits without
++	// the address space's lock, like Linux drops mmap_lock.
++	struct vm_fault vmf = {
++		.vma = vma,
++		.pgoff = vma->vm_pgoff + index,
++		.address = vma->vm_start + index * PAGE_SIZE,
++		.flags = FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_RETRY_NOWAIT
++			| ((vma->vm_flags & VM_WRITE) != 0 ? FAULT_FLAG_WRITE : 0),
++	};
++	vm_fault_t result = vma->vm_ops->fault(&vmf);
++	if ((result & VM_FAULT_ERROR) != 0)
++		return -EFAULT;
++	if ((result & VM_FAULT_RETRY) != 0 || vma->linuxkpi_physical[index] == 0)
++		return 1;
++	return 0;
++}
++
++
++/*!	A buffer moves. \a begin and \a length are in the file's mmap() offsets;
++	a \a length of 0 means up to the end. Those offsets are per DRM device, so
++	another device's mappings may get hit by the same range, and then just
++	fault their pages in again.
++*/
++void
++linuxkpi_chrdev_unmap_range(long long begin, long long length)
++{
++	unsigned long first = begin >> PAGE_SHIFT;
++	unsigned long last = length != 0
++		? (unsigned long)((begin + length - 1) >> PAGE_SHIFT) : ULONG_MAX;
++
++	struct chrdev_mapping *mapping;
++	mutex_lock(&sChrdevLock);
++	list_for_each_entry(mapping, &sMappings, link) {
++		struct vm_area_struct *vma = mapping->vma;
++		unsigned long start = vma->vm_pgoff;
++		unsigned long end = start + vma->linuxkpi_pages - 1;
++		if (end < first || start > last)
++			continue;
++		unsigned long from = max(start, first);
++		unsigned long to = min(end, last);
++		lkpi_haiku_user_mapping_clear(mapping->haiku, from - start,
++			to - from + 1);
++	}
++	mutex_unlock(&sChrdevLock);
++}
++
++
++static void
++release_mapping(struct chrdev_mapping *mapping)
++{
++	struct vm_area_struct *vma = mapping->vma;
++	lkpi_haiku_user_mapping_release(mapping->haiku);
++	if (vma->vm_ops != NULL && vma->vm_ops->close != NULL)
++		vma->vm_ops->close(vma);
++	fput(vma->vm_file);
++	kvfree(vma->linuxkpi_physical);
++	kfree(vma);
++	kfree(mapping);
++}
++
++
++/*!	Teams exit without unmapping, or crash: their areas go, and nobody tells us.
++	So look for mappings no team has anymore, for as long as there are any.
++*/
++static void
++sweep_mappings(struct work_struct *work)
++{
++	LIST_HEAD(unused);
++	struct chrdev_mapping *mapping, *next;
++	mutex_lock(&sChrdevLock);
++	list_for_each_entry_safe(mapping, next, &sMappings, link) {
++		if (lkpi_haiku_user_mapping_unused(mapping->haiku))
++			list_move(&mapping->link, &unused);
++	}
++	bool more = !list_empty(&sMappings);
++	mutex_unlock(&sChrdevLock);
++
++	// Closing a file can move buffers, which wants the lock.
++	list_for_each_entry_safe(mapping, next, &unused, link) {
++		list_del(&mapping->link);
++		release_mapping(mapping);
++	}
++	if (more)
++		schedule_delayed_work(&sMappingSweep, HZ);
++}
++
++
++void
++linuxkpi_chrdev_stop_mapping_sweep(void)
++{
++	cancel_delayed_work_sync(&sMappingSweep);
++}
++
++
+ int
+ linuxkpi_chrdev_munmap(void *address)
+ {
++	void *haiku = lkpi_haiku_user_mapping_for(address);
+ 	int area = lkpi_haiku_user_area_for(address);
+-	if (area < 0)
+-		return area;
++	if (haiku == NULL || area < 0)
++		return -EINVAL;
+ 
+ 	struct chrdev_mapping *mapping, *found = NULL;
+ 	mutex_lock(&sChrdevLock);
+ 	list_for_each_entry(mapping, &sMappings, link) {
+-		if (mapping->area == area) {
++		if (mapping->haiku == haiku) {
+ 			found = mapping;
+-			list_del(&found->link);
+ 			break;
+ 		}
+ 	}
+@@ -429,11 +514,21 @@ linuxkpi_chrdev_munmap(void *address)
+ 		return -EINVAL;
+ 
+ 	lkpi_haiku_unmap_user(area);
+-	struct vm_area_struct *vma = found->vma;
+-	if (vma->vm_ops != NULL && vma->vm_ops->close != NULL)
+-		vma->vm_ops->close(vma);
+-	fput(vma->vm_file);
+-	kfree(vma);
+-	kfree(found);
++
++	// The usual case, without waiting for the sweep (which may have been
++	// here already, so look it up again); a forked team may still have it.
++	bool unused = false;
++	mutex_lock(&sChrdevLock);
++	list_for_each_entry(mapping, &sMappings, link) {
++		if (mapping == found) {
++			unused = lkpi_haiku_user_mapping_unused(haiku) != 0;
++			if (unused)
++				list_del(&found->link);
++			break;
++		}
++	}
++	mutex_unlock(&sChrdevLock);
++	if (unused)
++		release_mapping(found);
+ 	return 0;
+ }
+diff --git a/src/libs/compat/linuxkpi/linux/misc.c b/src/libs/compat/linuxkpi/linux/misc.c
+index 47862a825f..9c94911d6c 100644
+--- a/src/libs/compat/linuxkpi/linux/misc.c
++++ b/src/libs/compat/linuxkpi/linux/misc.c
+@@ -636,9 +636,8 @@ dynamic_dname(char *buf, int buflen, const char *fmt, ...)
+ //	#pragma mark - mappings to userspace
+ 
+ 
+-/*!	Mappings to userspace are made whole when they are created (see
+-	chrdev.c): linuxkpi calls the fault handler for every page, and the
+-	inserts land in the vma's page list instead of a page table.
++/*!	Inserts land in the vma's table of pages instead of a page table; the
++	mapping's cache maps them from there (see chrdev.c).
+ */
+ pgprot_t
+ vm_get_page_prot(unsigned long vm_flags)
+@@ -654,9 +653,12 @@ insert_physical(struct vm_area_struct *vma, unsigned long addr,
+ 	unsigned long index = (addr - vma->vm_start) >> PAGE_SHIFT;
+ 	if (vma->linuxkpi_physical == NULL || index >= vma->linuxkpi_pages)
+ 		return VM_FAULT_SIGBUS;
+-	if (vma->linuxkpi_physical[index] == 0)
+-		vma->linuxkpi_physical[index] = physical;
+-	vma->linuxkpi_cache = pgprot_val(pgprot) & _PAGE_CACHE_MASK;
++	int cacheMode = LKPI_HAIKU_CACHE_CACHED;
++	if ((pgprot_val(pgprot) & _PAGE_CACHE_MASK) == _PAGE_CACHE_WC)
++		cacheMode = LKPI_HAIKU_CACHE_WRITE_COMBINING;
++	else if ((pgprot_val(pgprot) & _PAGE_CACHE_MASK) == _PAGE_CACHE_UC)
++		cacheMode = LKPI_HAIKU_CACHE_UNCACHED;
++	vma->linuxkpi_physical[index] = physical | LKPI_HAIKU_ENTRY(cacheMode);
+ 	return VM_FAULT_NOPAGE;
+ }
+ 
+@@ -729,7 +731,7 @@ void
+ unmap_mapping_range(struct address_space *mapping, loff_t const holebegin,
+ 	loff_t const holelen, int even_cows)
+ {
+-	// TODO: once buffers can be mapped into teams, unmap them here.
++	linuxkpi_chrdev_unmap_range(holebegin, holelen);
+ }
+ 
+ 

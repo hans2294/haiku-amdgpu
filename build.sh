@@ -35,7 +35,8 @@ fi
 step "the driver, libdrm, the test programs and the sysroot"
 jam -q -j"$jobs" amdgpu amdgpu_kms.accelerant libdrm.so libdrm_amdgpu.so \
 	libposix_error_mapper.a libgame.so haiku_cross_devel_sysroot_x86_64.hpkg \
-	amdgputest gltest kmstest libdrmtest vkheadless tearingtest vkwindow vsynctest \
+	amdgputest evicttest gltest kmstest libdrmtest vkheadless tearingtest vkwindow \
+	vsynctest hda \
 	'<build>bfs_shell' \
 	> ../logs/build-jam-targets.log 2>&1
 cd ..

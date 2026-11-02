@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 18:02:40 +0100
+Subject: [PATCH] hda: Digital output on Navi 31's HDMI/DP audio
+
+Haiku's hda skips digital outputs, so the card's audio device had no active
+codec. Turned on for 1002:ab30 only: for everyone, it took away the settings of
+analog codecs (#20171, reverted in hrev59826).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/drivers/audio/hda/driver.h        | 12 ++++++++++++
+ src/add-ons/kernel/drivers/audio/hda/hda_codec.cpp   |  6 ++++--
+ .../kernel/drivers/audio/hda/hda_codec_defs.h        |  5 +++++
+ .../kernel/drivers/audio/hda/hda_controller.cpp      |  4 +++-
+ 4 files changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/audio/hda/driver.h b/src/add-ons/kernel/drivers/audio/hda/driver.h
+index 330b28f4e7..4554f19a6e 100644
+--- a/src/add-ons/kernel/drivers/audio/hda/driver.h
++++ b/src/add-ons/kernel/drivers/audio/hda/driver.h
+@@ -361,6 +361,18 @@ hda_widget* hda_audio_group_get_widget(hda_audio_group* audioGroup, uint32 nodeI
+ 
+ status_t hda_audio_group_get_widgets(hda_audio_group* audioGroup,
+ 	hda_stream* stream);
++/*!	Navi 31's HDMI/DP audio (1002:ab30), the only digital output we use: the
++	audio of a monitor that plays through its own speakers or AUX output.
++	Digital outputs on other hardware stay off, as Haiku has them: turning them
++	on for everyone took away the settings of analog codecs (#20171).
++*/
++static inline bool
++hda_codec_uses_digital_output(const hda_codec* codec)
++{
++	const pci_info& info = codec->controller->pci_info;
++	return info.vendor_id == 0x1002 && info.device_id == 0xab30;
++}
++
+ hda_codec* hda_codec_new(hda_controller* controller, uint32 cad);
+ void hda_codec_delete(hda_codec* codec);
+ 
+diff --git a/src/add-ons/kernel/drivers/audio/hda/hda_codec.cpp b/src/add-ons/kernel/drivers/audio/hda/hda_codec.cpp
+index b15a677d7b..1909b71653 100644
+--- a/src/add-ons/kernel/drivers/audio/hda/hda_codec.cpp
++++ b/src/add-ons/kernel/drivers/audio/hda/hda_codec.cpp
+@@ -1444,9 +1444,11 @@ hda_audio_group_get_widgets(hda_audio_group* audioGroup, hda_stream* stream)
+ 			}
+ 		}
+ 
++		uint32 audioMask = AUDIO_CAP_STEREO;
++		if (!hda_codec_uses_digital_output(audioGroup->codec))
++			audioMask |= AUDIO_CAP_DIGITAL;
+ 		if (widget.type != type || (widget.flags & flags) == 0
+-			|| (widget.capabilities.audio
+-				& (AUDIO_CAP_STEREO | AUDIO_CAP_DIGITAL)) != AUDIO_CAP_STEREO
++			|| (widget.capabilities.audio & audioMask) != AUDIO_CAP_STEREO
+ 			|| widget.d.io.formats == 0)
+ 			continue;
+ 
+diff --git a/src/add-ons/kernel/drivers/audio/hda/hda_codec_defs.h b/src/add-ons/kernel/drivers/audio/hda/hda_codec_defs.h
+index b3eb6c4c7c..d4a6c3357d 100644
+--- a/src/add-ons/kernel/drivers/audio/hda/hda_codec_defs.h
++++ b/src/add-ons/kernel/drivers/audio/hda/hda_codec_defs.h
+@@ -384,4 +384,9 @@ enum pin_dev_type {
+ #define GPIO_COUNT_GPIWAKE(c) ((c & GPIO_COUNT_GPIWAKE_MASK) >> GPIO_COUNT_GPIWAKE_SHIFT)
+ 
+ 
++// SET_DIGITAL_CONVERTER_CONTROL1 values
++enum {
++	DIGITAL_CONVERTER_DIGEN = 1L << 0
++};
++
+ #endif /* HDA_CODEC_H */
+diff --git a/src/add-ons/kernel/drivers/audio/hda/hda_controller.cpp b/src/add-ons/kernel/drivers/audio/hda/hda_controller.cpp
+index 49e2e9aa35..3a50c25f0f 100644
+--- a/src/add-ons/kernel/drivers/audio/hda/hda_controller.cpp
++++ b/src/add-ons/kernel/drivers/audio/hda/hda_controller.cpp
+@@ -1013,8 +1013,10 @@ hda_stream_setup_buffers(hda_audio_group* audioGroup, hda_stream* stream,
+ 		hda_widget* widget = hda_audio_group_get_widget(audioGroup,
+ 			stream->io_widgets[i]);
+ 		if ((widget->capabilities.audio & AUDIO_CAP_DIGITAL) != 0) {
++			uint32 control = hda_codec_uses_digital_output(codec)
++				? DIGITAL_CONVERTER_DIGEN : format;
+ 			verb[0] = MAKE_VERB(codec->addr, stream->io_widgets[i],
+-				VID_SET_DIGITAL_CONVERTER_CONTROL1, format);
++				VID_SET_DIGITAL_CONVERTER_CONTROL1, control);
+ 			hda_send_verbs(codec, verb, response, 1);
+ 		}
+ 	}

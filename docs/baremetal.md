@@ -219,3 +219,30 @@ Nyere kerner kan ikke tjekkes på forhånd, så en senere ændring af kernens pr
 strukturer kan stadig give panik.
 
 Ikke prøvet på almindelig Haiku: Haikus Installer, en rigtig maskine og 240 Hz.
+
+## Lyd gennem kortet (HDMI/DP)
+
+Haikus `hda` springer digitale udgange over, så kortets lydenhed gav `no active codec`.
+En rettelse i `hda` slår dem til, men kun for Navi 31's lydenhed (1002:ab30). Haiku slog
+det til for alle i hrev59825 og rullede det tilbage, fordi analoge lydkort mistede deres
+indstillinger (#20171). Den skriver også `DIGEN` i converter-kontrollen i stedet for
+formatet.
+
+Afprøvet i VM'en (2026-11-01): toner fra MediaPlayer lød på skærmens AUX-udgang over DP
+ved 1280x720. Stereo, 48 kHz, 16 bit. Ikke prøvet: HDMI, maskinen selv, hvor der er flere
+lydenheder at vælge imellem, og flere kanaler. AMD's egne indstillinger for kanaler og
+infoframes bruges ikke, og det var ikke nødvendigt for stereo.
+
+Haikus egen `hda` vinder over den i `non-packaged`, så den skal blokeres i
+`/boot/system/settings/packages`:
+
+    Package haiku {
+    	BlockedEntries {
+    		add-ons/kernel/drivers/dev/audio/hmulti/hda
+    		add-ons/kernel/drivers/bin/hda
+    	}
+    }
+
+Den rettede fil lægges i `non-packaged/add-ons/kernel/drivers/bin/hda`, med et link fra
+`non-packaged/add-ons/kernel/drivers/dev/audio/hmulti/hda` til `../../../bin/hda`. I et
+fuldt image er rettelsen med i Haikus egen pakke, hvis den er bygget ind.

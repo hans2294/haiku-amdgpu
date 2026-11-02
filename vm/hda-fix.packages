@@ -1,0 +1,7 @@
+# Haiku's own hda would win over the one in non-packaged; see docs/baremetal.md
+Package haiku {
+	BlockedEntries {
+		add-ons/kernel/drivers/dev/audio/hmulti/hda
+		add-ons/kernel/drivers/bin/hda
+	}
+}
