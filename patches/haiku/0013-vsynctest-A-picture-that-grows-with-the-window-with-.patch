@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 21:56:27 +0100
+Subject: [PATCH] vsynctest: A picture that grows with the window, with the
+ lock kept
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/bin/vsynctest/vsynctest.cpp | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/src/bin/vsynctest/vsynctest.cpp b/src/bin/vsynctest/vsynctest.cpp
+index a4928bc5b3..ae94d0d3a1 100644
+--- a/src/bin/vsynctest/vsynctest.cpp
++++ b/src/bin/vsynctest/vsynctest.cpp
+@@ -186,6 +186,37 @@ public:
+ 		window->Lock();
+ 		window->Quit();
+ 
++		// A program that takes the lock once and keeps it, like with SDL: a
++		// bigger window has to get a bigger picture all the same.
++		BWindow* growing = new BWindow(BRect(50, 100, 305, 355), "vsynctest grow",
++			B_TITLED_WINDOW, 0);
++		BGLView* growingView = new BGLView(growing->Bounds(), "gl", B_FOLLOW_ALL,
++			0, BGL_RGB | BGL_DOUBLE);
++		growing->AddChild(growingView);
++		growing->Show();
++		snooze(300000);
++		growingView->LockGL();
++		glClearColor(0.25f, 0.25f, 0.25f, 1.0f);
++		glClear(GL_COLOR_BUFFER_BIT);
++		growingView->SwapBuffers();
++		growing->Lock();
++		growing->ResizeTo(600, 500);
++		BRect grown = growingView->ConvertToScreen(growingView->Bounds());
++		growing->Unlock();
++		snooze(300000);
++		for (int i = 0; i < 3; i++) {
++			glViewport(0, 0, 601, 501);
++			glClearColor(0.25f, 0.75f, 0.5f, 1.0f);
++			glClear(GL_COLOR_BUFFER_BIT);
++			growingView->SwapBuffers();
++			snooze(50000);
++		}
++		growingView->UnlockGL();
++		check_pixel(screen, grown.OffsetByCopy(400, 300), 64, 191, 128,
++			"picture grows with the window");
++		growing->Lock();
++		growing->Quit();
++
+ 		DirectWindow* direct = new DirectWindow(BRect(400, 100, 655, 355));
+ 		BGLView* directView = new BGLView(direct->Bounds(), "gl", B_FOLLOW_ALL,
+ 			0, BGL_RGB | BGL_DOUBLE);

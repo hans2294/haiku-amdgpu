@@ -54,11 +54,11 @@ There is no video decoding, and only the first connected monitor is used. With
   [Haiku versions](#haiku-versions).
 - **A panic looks like a freeze.** The kernel debugger doesn't draw on the card's
   screen, so everything just stops, including the mouse and Caps Lock.
-- **There are unexplained failures.** In about 60 boots in the VM, one panicked with a
+- **There are unexplained failures.** In about 80 boots in the VM, one panicked with a
   page fault in the kernel's `remove_images`, which suggests corrupted kernel memory, and
-  it may well be this driver. Two more stopped during their first boot, at the same
-  package, before the driver had loaded. None of them came back in repeated runs, and the
-  causes are unknown.
+  it may well be this driver. Three more stopped at `package_daemon` early in the boot,
+  with all CPUs idle and before the driver had loaded, all soon after packages had changed.
+  None of them came back in repeated runs, and the causes are unknown.
 - `pkgman full-sync` removes `mesa_radeon` and puts Mesa 22 back.
 
 If Haiku doesn't boot with this installed, hold Shift during boot and either pick

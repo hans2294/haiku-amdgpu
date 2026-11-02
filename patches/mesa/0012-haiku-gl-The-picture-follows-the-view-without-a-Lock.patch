@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 21:56:26 +0100
+Subject: [PATCH] haiku-gl: The picture follows the view without a LockGL()
+
+A program that takes the lock once and keeps it, as Luanti seems to, never got a
+pbuffer of the new size, and drew a new size's viewport on the old one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/haiku-gl/GLView.cpp | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/src/haiku-gl/GLView.cpp b/src/haiku-gl/GLView.cpp
+index 22874e6..2da021c 100644
+--- a/src/haiku-gl/GLView.cpp
++++ b/src/haiku-gl/GLView.cpp
+@@ -196,6 +196,21 @@ update_surface(glview_state* state)
+ }
+ 
+ 
++/*!	After a frame: makes the pbuffer the view's size, for a program that took the
++	lock once and keeps it, so that LockGL() doesn't get to. The context is current.
++*/
++static void
++follow_view_size(glview_state* state)
++{
++	if (state->width == state->surfaceWidth
++		&& state->height == state->surfaceHeight)
++		return;
++	if (update_surface(state) && !eglMakeCurrent(state->display, state->surface,
++			state->surface, state->context))
++		fprintf(stderr, "BGLView: eglMakeCurrent failed (%#x)\n", eglGetError());
++}
++
++
+ //	#pragma mark - direct mode
+ 
+ 
+@@ -533,6 +548,7 @@ BGLView::SwapBuffers(bool vSync)
+ 			state->viewBounds.bottom = state->viewBounds.top
+ 				+ state->surfaceHeight - 1;
+ 			blit_to_screen(state, (fOptions & BGL_DOUBLE) != 0);
++			follow_view_size(state);
+ 			return;
+ 		}
+ 	}
+@@ -592,6 +608,8 @@ BGLView::SwapBuffers(bool vSync)
+ 		Flush();
+ 		UnlockLooper();
+ 	}
++
++	follow_view_size(state);
+ }
+ 
+ 
