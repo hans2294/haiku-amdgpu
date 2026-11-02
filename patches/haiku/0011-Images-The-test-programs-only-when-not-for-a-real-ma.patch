@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 19:50:52 +0100
+Subject: [PATCH] Images: The test programs only when not for a real machine
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/images/definitions/regular | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/build/jam/images/definitions/regular b/build/jam/images/definitions/regular
+index 600ef79c37..860186e2d4 100644
+--- a/build/jam/images/definitions/regular
++++ b/build/jam/images/definitions/regular
+@@ -6,7 +6,11 @@ include [ FDirName $(HAIKU_BUILD_RULES_DIR) images definitions minimum ] ;
+ SEARCH on [ FGristFiles userguide quicktour welcome ]
+ 	= [ FDirName $(HAIKU_TOP) data bin ] ;
+ SYSTEM_BIN += userguide quicktour welcome ;
+-SYSTEM_BIN += amdgputest evicttest gltest kmstest libdrmtest vkheadless tearingtest vkwindow vsynctest ;
++# The driver's test programs, not on an image for a real machine (vm/usb-image.sh)
++if ! $(NAVI_USB_IMAGE) {
++	SYSTEM_BIN += amdgputest evicttest gltest kmstest libdrmtest vkheadless
++		tearingtest vkwindow vsynctest ;
++}
+ 
+ SYSTEM_BIN += [ FFilterByBuildFeatures
+ 	cddb_lookup

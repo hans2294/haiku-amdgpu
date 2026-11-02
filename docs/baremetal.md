@@ -246,3 +246,19 @@ Haikus egen `hda` vinder over den i `non-packaged`, så den skal blokeres i
 Den rettede fil lægges i `non-packaged/add-ons/kernel/drivers/bin/hda`, med et link fra
 `non-packaged/add-ons/kernel/drivers/dev/audio/hmulti/hda` til `../../../bin/hda`. I et
 fuldt image er rettelsen med i Haikus egen pakke, hvis den er bygget ind.
+
+## Den interne GPU (Raphael, 1002:164e)
+
+Med `devices 164e` i driverens settings-fil (`sudo vm/try-igpu.sh <serienummer>`, fortrydes
+med `off`) kører driveren den interne GPU i stedet for 7900 GRE'en, med skærmen i bundkortet.
+Det er RDNA2 (GC 10.3.6, DCN 3.1.5) med 512 MiB VRAM.
+
+Den krævede to ting: firmwaren (12 filer, i pakken) og VBIOS'en, som på en APU ligger i
+ACPI-tabellen `VFCT`. ACPICA er ikke med i porten, så `pci_map_rom()` finder den via Haikus
+ACPI-modul.
+
+Afprøvet på maskinen selv (2026-11-02): skrivebordet kom op uden tearing, GLTeapot virkede,
+og Luanti og Firefox kørte en tid uden fejl. Det er kun brugerens indtryk: loggene er ikke
+læst, så det er ikke vist, hvor VBIOS'en kom fra, eller om buffere faktisk blev flyttet.
+Accelerantet bruger kun det første kort, så Haiku bruger ikke begge GPU'er på én gang.
+

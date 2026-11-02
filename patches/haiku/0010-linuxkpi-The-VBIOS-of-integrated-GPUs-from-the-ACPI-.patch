@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 19:50:52 +0100
+Subject: [PATCH] linuxkpi: The VBIOS of integrated GPUs from the ACPI VFCT
+ table
+
+Without ACPICA's interface, amdgpu_acpi_vfct_bios() can't read it, so
+pci_map_rom() finds it through Haiku's ACPI module. Worked on Raphael (1002:164e)
+on a real machine.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../compat/linuxkpi/haiku/haiku_kernel.cpp    | 54 +++++++++++++++++++
+ .../compat/linuxkpi/include/linuxkpi/haiku.h  |  5 ++
+ src/libs/compat/linuxkpi/linux/pci.c          | 17 ++++++
+ 3 files changed, 76 insertions(+)
+
+diff --git a/src/libs/compat/linuxkpi/haiku/haiku_kernel.cpp b/src/libs/compat/linuxkpi/haiku/haiku_kernel.cpp
+index 7a92b490f0..c3f961731a 100644
+--- a/src/libs/compat/linuxkpi/haiku/haiku_kernel.cpp
++++ b/src/libs/compat/linuxkpi/haiku/haiku_kernel.cpp
+@@ -7,6 +7,7 @@
+ /*!	linuxkpi's Haiku side: the kernel services the Linux side builds on. */
+ 
+ 
++#include <ACPI.h>
+ #include <KernelExport.h>
+ #include <OS.h>
+ #include <errno.h>
+@@ -487,6 +488,59 @@ lkpi_haiku_user_mapping_release(void* mapping)
+ }
+ 
+ 
++extern "C" const void*
++lkpi_haiku_acpi_vfct_image(unsigned int bus, unsigned int device,
++	unsigned int function, unsigned int vendorID, unsigned int deviceID,
++	size_t* _size)
++{
++	// As in atomfirmware.h
++	struct vfct_image_header {
++		uint32 bus;
++		uint32 device;
++		uint32 function;
++		uint16 vendor_id;
++		uint16 device_id;
++		uint16 subsystem_vendor_id;
++		uint16 subsystem_id;
++		uint32 revision;
++		uint32 image_length;
++	} _PACKED;
++	static const size_t kImageOffsetField = 0x34;
++	static const size_t kLengthField = 4;
++
++	acpi_module_info* acpi;
++	if (get_module(B_ACPI_MODULE_NAME, (module_info**)&acpi) != B_OK)
++		return NULL;
++
++	const void* image = NULL;
++	void* table;
++	if (acpi->get_table("VFCT", 0, &table) == B_OK && table != NULL) {
++		const uint8* bytes = (const uint8*)table;
++		uint32 length = *(const uint32*)(bytes + kLengthField);
++		uint32 offset = *(const uint32*)(bytes + kImageOffsetField);
++		while (offset + sizeof(vfct_image_header) <= length) {
++			const vfct_image_header* header
++				= (const vfct_image_header*)(bytes + offset);
++			offset += sizeof(vfct_image_header);
++			if (header->image_length > length - offset)
++				break;
++			// A bus number that differs is fine: firmware may number them
++			// differently.
++			if (header->image_length != 0 && header->vendor_id == vendorID
++				&& header->device_id == deviceID && header->device == device
++				&& header->function == function) {
++				image = bytes + offset;
++				*_size = header->image_length;
++				break;
++			}
++			offset += header->image_length;
++		}
++	}
++	// Keeps the module, and the table with it, for as long as the image is used.
++	return image;
++}
++
++
+ extern "C" void
+ lkpi_haiku_unmap_user(int area)
+ {
+diff --git a/src/libs/compat/linuxkpi/include/linuxkpi/haiku.h b/src/libs/compat/linuxkpi/include/linuxkpi/haiku.h
+index d2c20e74ff..e9dc7fbca0 100644
+--- a/src/libs/compat/linuxkpi/include/linuxkpi/haiku.h
++++ b/src/libs/compat/linuxkpi/include/linuxkpi/haiku.h
+@@ -58,6 +58,11 @@ int lkpi_haiku_user_mapping_unused(void *mapping);
+ void lkpi_haiku_user_mapping_release(void *mapping);
+ /* From the fault handler: 0 when the entry is filled, > 0 to try again, or -errno */
+ int linuxkpi_chrdev_fault(void *vma, unsigned long index);
++/* The VBIOS image for a device in the ACPI VFCT table, where UEFI leaves it on
++ * integrated GPUs; NULL if there is none. It stays valid. */
++const void *lkpi_haiku_acpi_vfct_image(unsigned int bus, unsigned int device,
++	unsigned int function, unsigned int vendorID, unsigned int deviceID,
++	size_t *_size);
+ void lkpi_haiku_unmap_user(int area);
+ /* The calling team's area at a user address, or a negative error */
+ int lkpi_haiku_user_area_for(const void *address);
+diff --git a/src/libs/compat/linuxkpi/linux/pci.c b/src/libs/compat/linuxkpi/linux/pci.c
+index 57b61eace9..4ac9f2a285 100644
+--- a/src/libs/compat/linuxkpi/linux/pci.c
++++ b/src/libs/compat/linuxkpi/linux/pci.c
+@@ -898,6 +898,16 @@ pci_disable_msi(struct pci_dev *dev)
+ void __iomem *
+ pci_map_rom(struct pci_dev *pdev, size_t *size)
+ {
++	// Linux reads this table in amdgpu_acpi_vfct_bios(), which needs ACPICA's
++	// interface; without it, drivers ask here next.
++	const void *image = lkpi_haiku_acpi_vfct_image(pdev->bus->number,
++		PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn), pdev->vendor,
++		pdev->device, size);
++	if (image != NULL) {
++		dev_info(&pdev->dev, "VBIOS from the ACPI VFCT table, %zu bytes\n", *size);
++		return (void __iomem *)image;
++	}
++
+ 	struct resource *res = &pdev->resource[PCI_ROM_RESOURCE];
+ 	if (res->flags == 0)
+ 		return NULL;
+@@ -920,6 +930,13 @@ pci_map_rom(struct pci_dev *pdev, size_t *size)
+ void
+ pci_unmap_rom(struct pci_dev *pdev, void __iomem *rom)
+ {
++	size_t size;
++	if ((const void *)rom == lkpi_haiku_acpi_vfct_image(pdev->bus->number,
++			PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn), pdev->vendor,
++			pdev->device, &size)) {
++		return;
++	}
++
+ 	iounmap(rom);
+ 	u32 base = config_read(pdev, PCI_ROM_ADDRESS, 4);
+ 	config_write(pdev, PCI_ROM_ADDRESS, 4, base & ~PCI_ROM_ADDRESS_ENABLE);

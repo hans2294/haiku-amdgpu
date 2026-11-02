@@ -20,6 +20,10 @@ bfsStart=8192
 bfsMiB=$(( (stickSize / sector - bfsStart) / 2048 ))
 
 vm/stop.sh 2>/dev/null || true
+# jam doesn't notice a file that is no longer in the package, and the two kinds
+# of image have different programs in it.
+rm -rf generated.x86_64/objects/haiku/x86_64/packaging/packages/haiku.hpkg \
+	generated.x86_64/objects/haiku/x86_64/packaging/packages_build/regular/hpkg_-haiku.hpkg
 (cd $out && PATH=$PWD/../tools/bin:$PATH NAVI_USB_IMAGE=1 HAIKU_IMAGE_SIZE=$bfsMiB \
 	jam -q -j12 @nightly-raw > ../logs/jam-usb-image.log 2>&1) \
 	|| { echo "usb-image: jam failed, see logs/jam-usb-image.log" >&2; exit 1; }

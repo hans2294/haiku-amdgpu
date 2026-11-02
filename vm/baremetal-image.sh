@@ -4,6 +4,10 @@
 # Then: sudo vm/write-usb.sh /dev/sdX
 cd "$(dirname "$0")/.." || exit 1
 vm/stop.sh 2>/dev/null
+# jam doesn't notice a file that is no longer in the package, and the two kinds
+# of image have different programs in it.
+rm -rf generated.x86_64/objects/haiku/x86_64/packaging/packages/haiku.hpkg \
+	generated.x86_64/objects/haiku/x86_64/packaging/packages_build/regular/hpkg_-haiku.hpkg
 (cd generated.x86_64 && PATH=$PWD/../tools/bin:$PATH \
 	jam -q -j12 @nightly-anyboot > ../logs/jam-image.log 2>&1) \
 	|| { echo "baremetal-image: jam failed, see logs/jam-image.log" >&2; exit 1; }

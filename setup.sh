@@ -44,7 +44,8 @@ done
 ln -sf ../../../config/UserBuildConfig haiku/build/jam/UserBuildConfig
 port/gen-autoconf.sh
 
-# Navi 31's firmware, as linux-firmware has it; checked against what ran here
+# The firmware of Navi 31 and Raphael, as linux-firmware has it; checked against
+# what ran here
 mkdir -p vm/firmware
 while read -r sum file; do
 	[ -f "vm/firmware/$file" ] || curl -sS --fail -o "vm/firmware/$file" "$firmwareURL/$file"

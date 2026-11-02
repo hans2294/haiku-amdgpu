@@ -6,7 +6,7 @@ on a Linux compatibility layer, with libdrm, Mesa's radeonsi (OpenGL 4.6) and RA
 
 **This is an experiment, not a product.** It was written almost entirely by an AI
 (Claude, from Anthropic), directed by one developer who doesn't work in C, in a
-couple of days, for fun. It has run on one graphics card. Nobody has reviewed the
+couple of days, for fun. It has run on two GPUs. Nobody has reviewed the
 code. It runs in the kernel, so a bug can crash the machine or damage data.
 
 **This is not a contribution to Haiku**, and please don't submit any of it there:
@@ -17,7 +17,8 @@ Haiku's.
 
 ## What works
 
-On an RX 7900 GRE (Navi 31: GC 11.0.0, DCN 3.2):
+On an RX 7900 GRE (Navi 31: GC 11.0.0, DCN 3.2), and most of it on an integrated
+Raphael GPU:
 
 - The desktop on the card, up to 5120x1440 at 240 Hz, with a hardware cursor
 - OpenGL 4.6 in ordinary `BGLView` programs: GLTeapot, SuperTuxKart and Luanti run
@@ -41,19 +42,22 @@ page flipping, a screenshot can show a frame that is one frame old.
   long tests on the RX 7900 GRE limited to 512 MiB of VRAM and a 256 MiB BAR
   (`vramlimit` and `vis_vramlimit` in the driver's settings file, and `evicttest`),
   but no card that is really small has run this.
-- **Only Navi 31 has run.** Code for GFX8 to GFX12 is built in, but only Navi 31's
-  firmware is included, and the driver only touches the IDs on its device list.
-  `/boot/home/config/settings/kernel/drivers/amdgpu` can change that (`devices 744c
-  164e` or `devices all`). Laptops and hybrid graphics are not expected to work.
+- **Only two GPUs have run.** The RX 7900 GRE, and Raphael, the integrated GPU of a
+  Ryzen 7600X (see [The integrated GPU](#the-integrated-gpu)). Code for GFX8 to GFX12 is
+  built in, but only the firmware of these two is included, and the driver only touches
+  the IDs on its device list. `/boot/home/config/settings/kernel/drivers/amdgpu` can
+  change that (`devices 744c` or `devices all`). Laptops and hybrid graphics are not
+  expected to work. Only one GPU can be used at a time.
 - **It depends on Haiku's kernel internals.** The driver uses private kernel
   interfaces, and a future nightly can break it with a kernel panic at boot. See
   [Haiku versions](#haiku-versions).
 - **A panic looks like a freeze.** The kernel debugger doesn't draw on the card's
   screen, so everything just stops, including the mouse and Caps Lock.
-- **There is an unexplained crash.** In about 50 boots in the VM, one panicked with
-  a page fault in the kernel's `remove_images`, which suggests corrupted kernel
-  memory, and one stopped during first boot. Neither came back in repeated runs, and
-  the cause is unknown. It may well be this driver.
+- **There are unexplained failures.** In about 60 boots in the VM, one panicked with a
+  page fault in the kernel's `remove_images`, which suggests corrupted kernel memory, and
+  it may well be this driver. Two more stopped during their first boot, at the same
+  package, before the driver had loaded. None of them came back in repeated runs, and the
+  causes are unknown.
 - `pkgman full-sync` removes `mesa_radeon` and puts Mesa 22 back.
 
 If Haiku doesn't boot with this installed, hold Shift during boot and either pick
@@ -76,6 +80,18 @@ stop you from installing on one, as the `haiku` package counts as compatible bac
 to R1~alpha, and GL then doesn't work. Stable releases have not been tried: r1beta6
 should be refused too, and would need its own build, as its kernel has a different
 debug level.
+
+## The integrated GPU
+
+Raphael (1002:164e, GC 10.3.6, DCN 3.1.5, 512 MiB of VRAM) has run on a real machine, for
+a short time: the desktop without tearing, GLTeapot, Luanti and Firefox, with nothing going
+wrong. To try it, with the monitor on the motherboard, on an installed disk:
+
+```bash
+sudo vm/try-igpu.sh <serial number of the disk>
+```
+
+The RX 7900 GRE is then not used, and `sudo vm/try-igpu.sh <serial> off` goes back to it.
 
 ## Sound over HDMI/DP
 
@@ -127,9 +143,11 @@ This replaces the system's `mesa`, `mesa_devel` and `mesa_swpipe`. To go back, u
 
 ## A full image
 
-An image includes this build's `app_server` with the tear-free desktop, and the test
-programs (`amdgputest`, `evicttest`, `gltest`, `kmstest`, `libdrmtest`, `tearingtest`, `vkheadless`,
-`vkwindow`, `vsynctest`):
+An image includes this build's `app_server` with the tear-free desktop, and the sound
+patch. `vm/baremetal-image.sh` makes one with the test programs (`amdgputest`, `evicttest`,
+`gltest`, `kmstest`, `libdrmtest`, `tearingtest`, `vkheadless`, `vkwindow`, `vsynctest`),
+which it runs at boot, for a VM. `vm/usb-image.sh` needs that one, too, and makes the one
+for a real machine, without them:
 
 ```bash
 vm/baremetal-image.sh
