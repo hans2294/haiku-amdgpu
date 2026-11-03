@@ -44,11 +44,9 @@ There is no video decoding, and only the first connected monitor is used. With
   (`vramlimit` and `vis_vramlimit` in the driver's settings file, and `evicttest`),
   but no card that is really small has run this.
 - **Only two GPUs have run.** The RX 7900 GRE, and Raphael, the integrated GPU of a
-  Ryzen 7600X (see [The integrated GPU](#the-integrated-gpu)). Code for GFX8 to GFX12 is
-  built in, but only the firmware of these two is included, and the driver only touches
-  the IDs on its device list. `/boot/home/config/settings/kernel/drivers/amdgpu` can
-  change that (`devices 744c` or `devices all`). Laptops and hybrid graphics are not
-  expected to work. Only one GPU can be used at a time.
+  Ryzen 7600X (see [Which GPU](#which-gpu)). Code for GFX8 to GFX12 is built in, but only
+  the firmware of these two is included, and the driver only touches these two by itself.
+  Laptops and hybrid graphics are not expected to work. Only one GPU can be used at a time.
 - **It depends on Haiku's kernel internals.** The driver uses private kernel
   interfaces, and a future nightly can break it with a kernel panic at boot. See
   [Haiku versions](#haiku-versions).
@@ -106,17 +104,23 @@ that draws without pause can still tear, and the numbers vary between runs. With
 straight into the frame buffer but go through a bitmap, which is slower. Higher resolutions and
 refresh rates have not been measured, and copying takes longer there.
 
-## The integrated GPU
+## Which GPU
+
+The driver takes the GPU the firmware showed the boot screen on, if that is an RX 7900 GRE
+or Raphael. So move the monitor and reboot. This has picked the right one both ways on one
+real machine, going by what was on the screen; the firmware decides, so a BIOS setting for the
+first display can matter more than the cable. If the boot screen is on anything else, the
+driver takes an RX 7900 GRE and leaves an integrated GPU alone, as it may have no monitor. That
+case has not been tried.
+
+`/boot/home/config/settings/kernel/drivers/amdgpu` decides instead, if it says anything:
+`devices 164e`, `devices 744c 164e` or `devices all`. The IDs are PCI device IDs of AMD GPUs.
+Any other card also needs its firmware in `/boot/system/non-packaged/data/firmware/amdgpu`, and has never
+run here.
 
 Raphael (1002:164e, GC 10.3.6, DCN 3.1.5, 512 MiB of VRAM) has run on a real machine, for
 a short time: the desktop without tearing, GLTeapot, Luanti and Firefox, with nothing going
-wrong. To try it, with the monitor on the motherboard, on an installed disk:
-
-```bash
-sudo vm/try-igpu.sh <serial number of the disk>
-```
-
-The RX 7900 GRE is then not used, and `sudo vm/try-igpu.sh <serial> off` goes back to it.
+wrong.
 
 ## Sound over HDMI/DP
 

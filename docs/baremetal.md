@@ -8,7 +8,7 @@ starter fra en USB-nøgle via UEFI, så maskinens diske ikke røres.
 | Enhed | Haiku |
 |---|---|
 | RX 7900 GRE (03:00.0, 1002:744c) | vores amdgpu (Linux 6.12 på linuxkpi) |
-| Raphael iGPU (1b:00.0, 1002:164e) | **ignoreres**: driveren tager kun enheder på sin liste |
+| Raphael iGPU (1b:00.0, 1002:164e) | vores amdgpu, hvis bootskærmen er på den; ellers **ignoreres** den |
 | GTX 1660 SUPER (04:00.0) | ingen driver; højst EFI-framebufferen, hvis firmwaren viser boot der |
 | NVMe (MAXIO, Intel 600P), SATA | nvme/ahci; Linux-partitionerne monteres ikke automatisk |
 | RTL8125 2.5GbE | `rtl8125` (DHCP, sshd kører) |
@@ -129,8 +129,10 @@ kopierer `syslog` og `previous_syslog` (og en evt. testrapport) til
 
 ## Andre GPU'er
 
-Driveren tager kun Navi 31 (744c). Settings-filen
-`/boot/home/config/settings/kernel/drivers/amdgpu` kan ændre det:
+Driveren tager den GPU, firmwaren viste bootskærmen på, hvis det er Navi 31 (744c) eller Raphael
+(164e). Er bootskærmen et andet sted, tager den Navi 31 og lader en intern GPU være, for den har
+måske ingen skærm. Settings-filen `/boot/home/config/settings/kernel/drivers/amdgpu` bestemmer,
+hvis den siger noget:
 
     devices 744c 164e
 
@@ -249,9 +251,9 @@ fuldt image er rettelsen med i Haikus egen pakke, hvis den er bygget ind.
 
 ## Den interne GPU (Raphael, 1002:164e)
 
-Med `devices 164e` i driverens settings-fil (`sudo vm/try-igpu.sh <serienummer>`, fortrydes
-med `off`) kører driveren den interne GPU i stedet for 7900 GRE'en, med skærmen i bundkortet.
-Det er RDNA2 (GC 10.3.6, DCN 3.1.5) med 512 MiB VRAM.
+Driveren tager den interne GPU af sig selv, når firmwaren viser bootskærmen på den, altså her med
+skærmen i bundkortet: adressen på bootskærmens framebuffer ligger i en af GPU'ens BAR'er. Det er
+RDNA2 (GC 10.3.6, DCN 3.1.5) med 512 MiB VRAM.
 
 Den krævede to ting: firmwaren (12 filer, i pakken) og VBIOS'en, som på en APU ligger i
 ACPI-tabellen `VFCT`. ACPICA er ikke med i porten, så `pci_map_rom()` finder den via Haikus
@@ -261,6 +263,10 @@ Afprøvet på maskinen selv (2026-11-02): skrivebordet kom op uden tearing, GLTe
 og Luanti og Firefox kørte en tid uden fejl. Det er kun brugerens indtryk: loggene er ikke
 læst, så det er ikke vist, hvor VBIOS'en kom fra, eller om buffere faktisk blev flyttet.
 Accelerantet bruger kun det første kort, så Haiku bruger ikke begge GPU'er på én gang.
+
+Valget afprøvet på maskinen selv (2026-11-03): med skærmen i 7900 GRE'en og derefter i bundkortet
+valgte driveren det rigtige kort begge gange, efter brugerens Screen og GLTeapot. Loggen er ikke
+læst. Ikke afprøvet: bootskærmen på 1660'eren, hvor driveren skal tage 7900 GRE'en.
 
 ## Uden tearing på en almindelig Haiku
 
