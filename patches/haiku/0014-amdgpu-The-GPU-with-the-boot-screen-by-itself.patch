@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 15:46:58 +0100
+Subject: [PATCH] amdgpu: The GPU with the boot screen by itself
+
+Navi 31 or Raphael, whichever the firmware showed the boot screen on, or else
+Navi 31; the integrated GPU is left alone unless it shows it, as it may well
+have no monitor. The settings file still decides, if it says anything.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/graphics/amdgpu/driver.cpp | 92 ++++++++++++++++---
+ 1 file changed, 81 insertions(+), 11 deletions(-)
+
+diff --git a/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp b/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp
+index f41369f90b..68e1961367 100644
+--- a/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp
++++ b/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp
+@@ -18,11 +18,13 @@
+ 	Haiku fds of the calling team that the driver opens on that node (see
+ 	linuxkpi_fd_reserve() and its friends).
+ 
+-	Only GPUs on the device list are probed: Navi 31 (1002:744c), the one
+-	this port was brought up on, unless the driver settings file "amdgpu"
+-	says otherwise ("devices 744c 164e", PCI device IDs of AMD GPUs, or
+-	"devices all"). A machine's other AMD GPUs (an integrated one, say) stay
+-	untouched that way.
++	Only GPUs on the device list are probed. That is the GPU that shows the boot
++	screen, if it is one of those this port has run on: Navi 31 (1002:744c) or
++	Raphael (1002:164e), the integrated GPU of a Ryzen 7000. If the boot screen
++	is elsewhere, it is Navi 31, and an integrated GPU is left alone, as it may
++	well have no monitor. The driver settings file "amdgpu" can say otherwise
++	("devices 744c 164e", PCI device IDs of AMD GPUs, or "devices all"). A
++	machine's other AMD GPUs stay untouched that way.
+ 
+ 	The status node is in /dev/misc so app_server leaves it alone; it also
+ 	keeps the driver loaded when probing failed, as devfs unloads drivers
+@@ -34,7 +36,9 @@
+ 
+ 
+ #include <Drivers.h>
++#include <boot_item.h>
+ #include <driver_settings.h>
++#include <frame_buffer_console.h>
+ #include <KernelExport.h>
+ #include <graphic_driver.h>
+ #include <PCI.h>
+@@ -73,7 +77,13 @@ static const int kMaxDevices = 16;
+ static const char* sDeviceNames[kMaxDevices + 1];
+ 
+ static const uint32 kAmdVendor = 0x1002;
+-static const uint32 kDefaultDevices[] = { 0x744c };	// Navi 31
++static const struct {
++	uint32	device;
++	bool	integrated;
++} kDefaultDevices[] = {
++	{ 0x744c, false },	// Navi 31
++	{ 0x164e, true },	// Raphael
++};
+ static const int kMaxListedDevices = 16;
+ static uint32 sAllowedDevices[kMaxListedDevices];	// vendor << 16 | device
+ static int sAllowedDeviceCount = -1;				// all of them
+@@ -89,6 +99,69 @@ extern "C" unsigned int amdgpu_vram_limit;
+ extern "C" int amdgpu_vis_vram_limit;
+ 
+ 
++/*!	Whether the frame buffer the firmware left us is in one of the GPU's BARs. */
++static bool
++shows_boot_screen(const pci_info& info)
++{
++	const frame_buffer_boot_info* screen = (const frame_buffer_boot_info*)
++		get_boot_item(FRAME_BUFFER_BOOT_INFO, NULL);
++	if (screen == NULL)
++		return false;
++
++	for (int i = 0; i < 6; i++) {
++		uint64 base = info.u.h0.base_registers[i];
++		uint64 size = info.u.h0.base_register_sizes[i];
++		uint32 flags = info.u.h0.base_register_flags[i];
++		if ((flags & PCI_address_type) == PCI_address_type_64 && i < 5) {
++			i++;
++			base |= (uint64)info.u.h0.base_registers[i] << 32;
++			size |= (uint64)info.u.h0.base_register_sizes[i] << 32;
++		}
++		if ((flags & PCI_address_space) == 0 && size != 0
++			&& screen->physical_frame_buffer >= base
++			&& screen->physical_frame_buffer - base < size) {
++			return true;
++		}
++	}
++	return false;
++}
++
++
++/*!	The default device list: the GPU with the boot screen, or else any that
++	isn't integrated. Only one GPU can be used at a time.
++*/
++static void
++choose_default_devices()
++{
++	pci_module_info* pci;
++	if (get_module(B_PCI_MODULE_NAME, (module_info**)&pci) == B_OK) {
++		pci_info info;
++		for (int32 i = 0; pci->get_nth_pci_info(i, &info) == B_OK; i++) {
++			if (info.vendor_id != kAmdVendor || info.class_base != PCI_display)
++				continue;
++			for (size_t j = 0; j < B_COUNT_OF(kDefaultDevices); j++) {
++				if (info.device_id == kDefaultDevices[j].device
++					&& shows_boot_screen(info)) {
++					TRACE("the boot screen is on %04x\n", info.device_id);
++					sAllowedDevices[sAllowedDeviceCount++] = kAmdVendor << 16
++						| info.device_id;
++					put_module(B_PCI_MODULE_NAME);
++					return;
++				}
++			}
++		}
++		put_module(B_PCI_MODULE_NAME);
++	}
++
++	for (size_t i = 0; i < B_COUNT_OF(kDefaultDevices); i++) {
++		if (!kDefaultDevices[i].integrated) {
++			sAllowedDevices[sAllowedDeviceCount++] = kAmdVendor << 16
++				| kDefaultDevices[i].device;
++		}
++	}
++}
++
++
+ /*!	The device list from the settings file, or the default one. */
+ static void
+ read_device_list()
+@@ -120,11 +193,8 @@ read_device_list()
+ 			sAllowedDevices[sAllowedDeviceCount++] = kAmdVendor << 16
+ 				| strtoul(devices->values[i], NULL, 16);
+ 		}
+-	} else {
+-		for (size_t i = 0; i < B_COUNT_OF(kDefaultDevices); i++)
+-			sAllowedDevices[sAllowedDeviceCount++] = kAmdVendor << 16
+-				| kDefaultDevices[i];
+-	}
++	} else
++		choose_default_devices();
+ 	unload_driver_settings(handle);
+ }
+ 
