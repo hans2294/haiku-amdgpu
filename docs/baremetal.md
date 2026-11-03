@@ -297,3 +297,12 @@ billeder over 15 sekunder, 1920x1080 ved 60 Hz, officiel hrev60317, med skyggen 
 Et program, der tegner uden pause, kan stadig knække billeder. Ikke målt: 5120x1440 ved 240 Hz og
 maskinen selv.
 
+## Andre kort
+
+`port/build-firmware-package.sh` bygger `amdgpu_firmware`, resten af
+linux-firmwares amdgpu-mappe uden ISP-filen: 672 filer og 35 MB. `amdgpu-report` i `amdgpu_linux`
+skriver kort, indstillinger og driverens linjer fra dette og forrige boot til `~/amdgpu-report.txt`.
+
+Står `devices` i driverens settings-fil, er der en boot-vagt: `amdgpu_boot_guard` ved siden af den
+skrives med fsync, før kortet startes, og fjernes et minut efter, hvis kortet kom op. Findes filen
+ved næste boot, holder driveren sig væk, og skrivebordet kommer op på framebufferen.

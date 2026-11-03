@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hans2294 <22217531+hans2294@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 16:20:33 +0100
+Subject: [PATCH] amdgpu: A boot guard when trying a GPU from the settings file
+
+Written before the GPU is started, and removed a minute after. If a boot finds it,
+the driver stays away until it is deleted, and the desktop comes up on the frame
+buffer. A freeze would otherwise come back at every boot.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kernel/drivers/graphics/amdgpu/driver.cpp | 84 +++++++++++++++++++
+ 1 file changed, 84 insertions(+)
+
+diff --git a/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp b/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp
+index 68e1961367..cb0c288945 100644
+--- a/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp
++++ b/src/add-ons/kernel/drivers/graphics/amdgpu/driver.cpp
+@@ -26,6 +26,13 @@
+ 	("devices 744c 164e", PCI device IDs of AMD GPUs, or "devices all"). A
+ 	machine's other AMD GPUs stay untouched that way.
+ 
++	A list from the settings file means someone is trying a GPU, which can freeze
++	the machine with nothing to show for it, so that comes with a boot guard: a
++	file written before the GPU is started and removed a minute after, if the GPU
++	came up. If the next boot finds it, the machine never got there, or the GPU
++	failed and may have left the screen dark, and the driver stays away until
++	someone deletes it; the desktop then comes up on the frame buffer.
++
+ 	The status node is in /dev/misc so app_server leaves it alone; it also
+ 	keeps the driver loaded when probing failed, as devfs unloads drivers
+ 	that publish nothing. The DRM nodes go straight to Linux's file
+@@ -44,6 +51,7 @@
+ #include <PCI.h>
+ #include <kernel.h>
+ #include <ksystem_info.h>
++#include <syscalls.h>
+ #include <fs/fd.h>
+ #include <lock.h>
+ #include <util/AutoLock.h>
+@@ -87,6 +95,13 @@ static const struct {
+ static const int kMaxListedDevices = 16;
+ static uint32 sAllowedDevices[kMaxListedDevices];	// vendor << 16 | device
+ static int sAllowedDeviceCount = -1;				// all of them
++static bool sDeviceListFromSettings;
++
++static const char* kBootGuardPath
++	= "/boot/home/config/settings/kernel/drivers/amdgpu_boot_guard";
++static const bigtime_t kBootGuardTime = 60000000;
++static thread_id sBootGuardThread = -1;
++static volatile bool sStopBootGuard;
+ 
+ static mutex sFileVnodeLock = MUTEX_INITIALIZER("linuxkpi file vnode");
+ static struct vnode* sFileVnode;
+@@ -167,6 +182,7 @@ static void
+ read_device_list()
+ {
+ 	sAllowedDeviceCount = 0;
++	sDeviceListFromSettings = false;
+ 	void* handle = load_driver_settings("amdgpu");
+ 	const driver_settings* settings = get_driver_settings(handle);
+ 	const driver_parameter* devices = NULL;
+@@ -184,6 +200,7 @@ read_device_list()
+ 			amdgpu_vis_vram_limit = strtoul(parameter.values[0], NULL, 10);
+ 	}
+ 	if (devices != NULL) {
++		sDeviceListFromSettings = true;
+ 		for (int i = 0; i < devices->value_count
+ 				&& sAllowedDeviceCount < kMaxListedDevices; i++) {
+ 			if (strcmp(devices->values[i], "all") == 0) {
+@@ -219,6 +236,54 @@ kernel_is_recent_enough()
+ }
+ 
+ 
++/*!	Whether the boot guard says an earlier boot never got past starting the GPU. */
++static bool
++boot_guard_tripped()
++{
++	struct stat st;
++	if (!sDeviceListFromSettings
++		|| _kern_read_stat(-1, kBootGuardPath, true, &st, sizeof(st)) != B_OK) {
++		return false;
++	}
++	dprintf("amdgpu: not loading: an earlier boot stopped or failed while starting "
++		"the GPU; delete %s to try again\n", kBootGuardPath);
++	return true;
++}
++
++
++/*!	Must be on the disk before the GPU is touched, as nothing gets written after a
++	freeze. A disk that can't be written to just means no guard.
++*/
++static void
++set_boot_guard()
++{
++	if (!sDeviceListFromSettings)
++		return;
++	int fd = _kern_open(-1, kBootGuardPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++	if (fd < 0) {
++		TRACE("no boot guard: %s\n", strerror(fd));
++		return;
++	}
++	static const char kText[] = "The machine stopped, or the GPU failed, while "
++		"starting the GPU. Delete this file to try again.\n";
++	_kern_write(fd, 0, kText, sizeof(kText) - 1);
++	_kern_fsync(fd, false);
++	_kern_close(fd);
++}
++
++
++static status_t
++boot_guard_thread(void*)
++{
++	bigtime_t end = system_time() + kBootGuardTime;
++	while (!sStopBootGuard && system_time() < end)
++		snooze(100000);
++	_kern_unlink(-1, kBootGuardPath);
++	TRACE("the boot guard is off\n");
++	return B_OK;
++}
++
++
+ static bool
+ device_allowed(const pci_info& info)
+ {
+@@ -243,6 +308,11 @@ init_hardware(void)
+ 		return B_ERROR;
+ 
+ 	read_device_list();
++	if (boot_guard_tripped()) {
++		put_module(B_PCI_MODULE_NAME);
++		return ENODEV;
++	}
++
+ 	status_t status = ENODEV;
+ 	pci_info info;
+ 	for (int32 i = 0; pci->get_nth_pci_info(i, &info) == B_OK; i++) {
+@@ -267,9 +337,18 @@ init_driver(void)
+ 		TRACE("probing %d listed device(s), the first %04" B_PRIx32 "\n",
+ 			sAllowedDeviceCount, sAllowedDevices[0] & 0xffff);
+ 	}
++	set_boot_guard();
+ 	TRACE("running the Linux init calls\n");
+ 	sInitResult = linuxkpi_run_initcalls();
+ 	TRACE("Linux init calls returned %d\n", sInitResult);
++	if (sDeviceListFromSettings) {
++		if (linuxkpi_chrdev_path(0) != NULL) {
++			sBootGuardThread = spawn_kernel_thread(boot_guard_thread,
++				"amdgpu boot guard", B_LOW_PRIORITY, NULL);
++			resume_thread(sBootGuardThread);
++		} else
++			TRACE("no GPU came up, so the boot guard stays on\n");
++	}
+ 	return B_OK;
+ }
+ 
+@@ -277,6 +356,11 @@ init_driver(void)
+ extern "C" void
+ uninit_driver(void)
+ {
++	if (sBootGuardThread >= 0) {
++		status_t result;
++		sStopBootGuard = true;
++		wait_for_thread(sBootGuardThread, &result);
++	}
+ 	TRACE("running the Linux exit calls\n");
+ 	linuxkpi_chrdev_stop_mapping_sweep();
+ 	linuxkpi_run_exitcalls();

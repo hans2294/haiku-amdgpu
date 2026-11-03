@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds the hpkg packages of the amdgpu port from what jam, port/mesa-build.sh
 # and port/vulkan-loader-build.sh built, into generated.x86_64/packages:
-#   amdgpu_linux    driver, accelerant, Navi 31 firmware
+#   amdgpu_linux    driver, accelerant, firmware of Navi 31 and Raphael, amdgpu-report
 #   libdrm          libdrm, libdrm_amdgpu, amdgpu.ids
 #   mesa_radeon     radeonsi (GL, EGL, GLES), RADV, libGL with BGLView
 #   vulkan_loader   libvulkan.so.1
@@ -39,6 +39,8 @@ cp "$objects/add-ons/kernel/drivers/graphics/amdgpu/amdgpu" \
 ln -s ../../bin/amdgpu "$d/add-ons/kernel/drivers/dev/graphics/amdgpu"
 cp "$objects/add-ons/accelerants/amdgpu_kms/amdgpu_kms.accelerant" \
 	"$d/add-ons/accelerants/"
+mkdir -p "$d/bin"
+cp "$top/port/amdgpu-report" "$d/bin/"
 cp "$top"/vm/firmware/*.bin "$top/licenses/LICENSE.amdgpu" "$d/data/firmware/amdgpu/"
 build amdgpu_linux
 

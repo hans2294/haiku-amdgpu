@@ -1,0 +1,20 @@
+name			amdgpu_firmware
+version			20261019-1
+architecture	x86_64
+summary			"Firmware for trying other AMD GPUs with amdgpu_linux"
+description		"The rest of linux-firmware's amdgpu folder, for GPUs that have not \
+run with amdgpu_linux. The firmware of the two that have is in amdgpu_linux."
+packager		"hans2294 <22217531+hans2294@users.noreply.github.com>"
+vendor			"hans2294"
+copyrights		{
+	"Advanced Micro Devices, Inc."
+}
+licenses		{
+	"AMD firmware"
+}
+provides {
+	amdgpu_firmware = 20261019
+}
+requires {
+	amdgpu_linux
+}

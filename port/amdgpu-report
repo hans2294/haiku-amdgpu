@@ -1,0 +1,42 @@
+#!/bin/sh
+# What someone trying a card can send along: the card, Haiku's revision, the driver's
+# settings and the driver's lines from the log, in ~/amdgpu-report.txt. Nothing is sent
+# anywhere. Read it before posting it.
+report=$HOME/amdgpu-report.txt
+settings=$HOME/config/settings/kernel/drivers
+bootLine="Welcome to the Haiku boot loader"
+{
+	echo "== Haiku"
+	uname -srvm
+	echo
+	echo "== Graphics cards (vendor 1002 is AMD)"
+	listdev | grep -A2 '^device Display controller'
+	echo
+	echo "== Settings file"
+	cat "$settings/amdgpu" 2>/dev/null || echo "none"
+	echo
+	echo "== Boot guard"
+	if [ -e "$settings/amdgpu_boot_guard" ]; then
+		echo "On, so the driver doesn't start the card. An earlier boot stopped or failed"
+		echo "there, or was restarted within a minute. Delete this to try again:"
+		echo "$settings/amdgpu_boot_guard"
+	else
+		echo "off"
+	fi
+	echo
+	echo "== Devices and screen"
+	ls /dev/graphics /dev/dri 2>&1
+	screenmode
+	echo
+	echo "== Packages"
+	ls /boot/system/packages | grep -E 'amdgpu|libdrm|mesa|vulkan_loader|^haiku-'
+	echo
+	echo "== The driver's lines from the log"
+	# This boot and the one before, as that may be the one that went wrong
+	logs="/boot/system/var/log/syslog.1 /boot/system/var/log/syslog"
+	boots=$(cat $logs 2>/dev/null | grep -ac "$bootLine")
+	cat $logs 2>/dev/null | awk -v skip=$((boots - 2)) "/$bootLine/ {boot++} boot > skip" \
+		| grep -aE "amdgpu|\[drm|linuxkpi|PANIC|$bootLine" \
+		| grep -av 'linuxkpi: .*init()$' | tail -n 300
+} > "$report" 2>&1
+echo "Written to $report"

@@ -46,7 +46,8 @@ There is no video decoding, and only the first connected monitor is used. With
 - **Only two GPUs have run.** The RX 7900 GRE, and Raphael, the integrated GPU of a
   Ryzen 7600X (see [Which GPU](#which-gpu)). Code for GFX8 to GFX12 is built in, but only
   the firmware of these two is included, and the driver only touches these two by itself.
-  Laptops and hybrid graphics are not expected to work. Only one GPU can be used at a time.
+  See [Trying another card](#trying-another-card). Laptops and hybrid graphics are not
+  expected to work. Only one GPU can be used at a time.
 - **It depends on Haiku's kernel internals.** The driver uses private kernel
   interfaces, and a future nightly can break it with a kernel panic at boot. See
   [Haiku versions](#haiku-versions).
@@ -115,12 +116,77 @@ case has not been tried.
 
 `/boot/home/config/settings/kernel/drivers/amdgpu` decides instead, if it says anything:
 `devices 164e`, `devices 744c 164e` or `devices all`. The IDs are PCI device IDs of AMD GPUs.
-Any other card also needs its firmware in `/boot/system/non-packaged/data/firmware/amdgpu`, and has never
-run here.
 
 Raphael (1002:164e, GC 10.3.6, DCN 3.1.5, 512 MiB of VRAM) has run on a real machine, for
 a short time: the desktop without tearing, GLTeapot, Luanti and Firefox, with nothing going
 wrong.
+
+## Trying another card
+
+No other card has run this, so nobody knows what happens on yours. RX 6000 and RX 7000 are
+the closest to the two that have, but that is a guess. Only try it on a machine that can
+stand a freeze, with its data backed up. A report is useful whether it works or not.
+
+1. Install the packages, with `amdgpu_firmware`, which has the firmware of the other cards
+   (from the release, or `port/build-firmware-package.sh`):
+
+   ```bash
+   pkgman install ./amdgpu_linux-*.hpkg ./libdrm-*.hpkg ./mesa_radeon-*.hpkg ./vulkan_loader-*.hpkg ./amdgpu_firmware-*.hpkg
+   ```
+
+2. Run `amdgpu-report` and find your card under *Graphics cards* in `~/amdgpu-report.txt`:
+   vendor 1002, and a device ID like `73bf`. Then put that ID in the driver's settings:
+
+   ```bash
+   mkdir -p ~/config/settings/kernel/drivers
+   ```
+
+   ```bash
+   echo "devices 73bf" > ~/config/settings/kernel/drivers/amdgpu
+   ```
+
+3. Reboot, with the monitor on that card. Leave it running for more than a minute.
+4. Run `amdgpu-report` again, read the file, and
+   [open an issue](https://github.com/hans2294/haiku-amdgpu/issues/new?template=another-card.md).
+
+What can happen:
+
+- **It works.** Screen names `amdgpu_kms` as the driver. Try GLTeapot.
+- **The driver gives up.** The desktop comes up on Haiku's frame buffer, and the report says
+  why, like a firmware file that is missing.
+- **It freezes or the screen stays dark.** Turn the machine off, within the first minute for
+  a dark screen. The next boot should come up on the frame buffer, because of the boot guard.
+
+**The boot guard** is a file, `amdgpu_boot_guard`, next to the settings file. The driver
+writes it before it starts the card, and removes it a minute later if the card came up. If a
+boot finds it, the driver leaves the card alone. To try again:
+
+```bash
+rm ~/config/settings/kernel/drivers/amdgpu_boot_guard
+```
+
+It only works with `devices` in the settings file, so it isn't there for the two cards above
+unless you name them. It doesn't help with a freeze after that minute: then hold Shift during
+boot, as under [Known problems](#known-problems). Rebooting within the minute also sets it off,
+which does no harm. It can't say why a machine froze. The report has the log of this boot and the one
+before, but turning the machine off, or a panic, loses what hadn't reached the disk, so a report
+after a freeze may say little. With a second GPU and Linux, [a VM](#in-a-vm) shows everything on its
+serial log.
+
+It has been tried on the RX 7900 GRE in a VM: stopping the VM hard, on hrev60317 and hrev60102, and
+hiding firmware files, on hrev60317. A real freeze, and a dark screen after a failed start, have
+not been tried. In the VM, the frame buffer is on a separate virtual card, so it stays up whatever
+happens to the real one.
+
+To stop trying, remove the settings and the firmware:
+
+```bash
+rm -f ~/config/settings/kernel/drivers/amdgpu ~/config/settings/kernel/drivers/amdgpu_boot_guard
+```
+
+```bash
+pkgman uninstall amdgpu_firmware
+```
 
 ## Sound over HDMI/DP
 
@@ -224,4 +290,5 @@ patches are under the licences of what they change: MIT for Haiku and Mesa's par
 and the others as in those projects. The driver is built from Linux's sources, so
 a built `amdgpu_linux` package is covered by the GPL v2 as well. The firmware is
 AMD's, under [its own licence](licenses/LICENSE.amdgpu), and isn't in this repository;
-`setup.sh` fetches it from linux-firmware.
+`setup.sh` and `port/build-firmware-package.sh` fetch it from linux-firmware. The latter leaves out
+`isp_4_1_1.bin`, which is under another licence.
